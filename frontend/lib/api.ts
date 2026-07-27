@@ -137,6 +137,15 @@ export interface Regime {
   ema200: number | null;
 }
 
+export interface Environment {
+  favourable: boolean;
+  score: number;
+  note: string;
+  trend_pct: number | null;
+  realized_vol: number | null;
+  chop: number | null;
+}
+
 export interface RejectedPick {
   ticker: string;
   quality_score: number;
@@ -162,6 +171,7 @@ export interface Plan {
   priced_at?: string;
   regime?: Regime;
   rejected?: RejectedPick[];
+  environment?: Environment;
 }
 
 export interface OpenPosition {

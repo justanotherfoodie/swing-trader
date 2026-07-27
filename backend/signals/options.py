@@ -196,6 +196,67 @@ def _leg_liquidity(row) -> tuple[int, int, bool]:
     return oi, vol, oi < MIN_OI_SOFT
 
 
+def assess_quality(ticker: str, signal: str, expiry: str, iv: float,
+                   open_interest: int, wide: bool, spread_pct: float,
+                   is_debit_spread: bool = False) -> dict:
+    """Score every way a directionally-correct trade can still lose money.
+
+    Shared by BOTH structures. A vertical spread is less exposed to some of these than a
+    naked long - the short leg you sell is priced with the same inflated IV you're paying
+    on the long leg, so rich premium partly cancels - but it is not immune, and earnings
+    or a strike nobody trades will wreck a spread just as thoroughly.
+    """
+    from .context import iv_assessment, earnings_check, regime_alignment
+
+    warnings: list[str] = []
+    score = 100
+
+    ivx = iv_assessment(ticker, iv)
+    # A debit spread finances part of its cost by selling premium at the same rich IV,
+    # so an expensive-vol regime hurts it roughly half as much as an outright long.
+    iv_weight = 0.5 if is_debit_spread else 1.0
+    if ivx["verdict"] == "very_rich":
+        score -= int(30 * iv_weight)
+        warnings.append(f"Very expensive premium ({ivx['ratio']}x realized vol)")
+    elif ivx["verdict"] == "rich":
+        score -= int(15 * iv_weight)
+        warnings.append(f"Expensive premium ({ivx['ratio']}x realized vol)")
+    elif ivx["verdict"] == "cheap":
+        score += 5
+
+    earn = earnings_check(ticker, expiry)
+    if earn["in_hold"]:
+        score -= 35
+        warnings.append(f"Earnings {earn['date']} inside the hold - IV crush risk")
+    elif earn["before_expiry"]:
+        score -= 5
+        warnings.append(f"Earnings {earn['date']} before expiry - be out first")
+
+    if open_interest < MIN_OI_SOFT:
+        score -= 30
+        warnings.append(f"Almost no open interest ({open_interest}) - you may not get filled fairly")
+    elif open_interest < MIN_OPEN_INTEREST:
+        score -= 12
+        warnings.append(f"Thin open interest ({open_interest})")
+
+    if wide:
+        score -= 12
+        warnings.append(f"Wide bid/ask ({spread_pct*100:.0f}%) - use a limit order")
+
+    reg = regime_alignment(signal)
+    if reg.get("against_trend"):
+        score -= 15
+        warnings.append(f"Against the market trend ({reg.get('regime')})")
+
+    return {
+        "score": max(0, min(100, score)),
+        "warnings": warnings,
+        "iv": ivx,
+        "earnings": earn,
+        "regime": reg,
+    }
+
+
 def _leg_spread_pct(row) -> float:
     """(ask-bid)/mid for one leg. Large values mean the quote won't hold at fill time -
     this is the actual cause of 'the app's price wasn't accurate': thin option chains
@@ -226,9 +287,11 @@ def build_options_play(ticker: str, signal: str, entry: float, target: float,
 
     try:
         if signal == "BUY":
-            return _bull_call_spread(chain.calls, entry, target, dte, expiry, entry, risk_budget)
+            return _bull_call_spread(chain.calls, entry, target, dte, expiry, entry,
+                                     risk_budget, ticker)
         else:
-            return _bear_put_spread(chain.puts, entry, target, dte, expiry, entry, risk_budget)
+            return _bear_put_spread(chain.puts, entry, target, dte, expiry, entry,
+                                    risk_budget, ticker)
     except Exception:
         return None
 
@@ -269,8 +332,6 @@ def build_long_option(ticker: str, signal: str, entry: float, target: float,
         return None
 
     try:
-        from .context import iv_assessment, earnings_check, regime_alignment
-
         is_call = signal == "BUY"
         df = (chain.calls if is_call else chain.puts).sort_values("strike").reset_index(drop=True)
         if df.empty:
@@ -325,45 +386,10 @@ def build_long_option(ticker: str, signal: str, entry: float, target: float,
         kind = "CALL" if is_call else "PUT"
         oi, strike_vol, thin = _leg_liquidity(row)
 
-        # ---- quality gates: score the trade down for each way it can quietly lose ----
-        warnings: list[str] = []
-        score = 100
-
-        ivx = iv_assessment(ticker, iv)
-        if ivx["verdict"] == "very_rich":
-            score -= 30
-            warnings.append(f"Very expensive premium ({ivx['ratio']}x realized vol)")
-        elif ivx["verdict"] == "rich":
-            score -= 15
-            warnings.append(f"Expensive premium ({ivx['ratio']}x realized vol)")
-        elif ivx["verdict"] == "cheap":
-            score += 5
-
-        earn = earnings_check(ticker, expiry)
-        if earn["in_hold"]:
-            score -= 35
-            warnings.append(f"Earnings {earn['date']} inside the hold - IV crush risk")
-        elif earn["before_expiry"]:
-            score -= 5
-            warnings.append(f"Earnings {earn['date']} before expiry - be out first")
-
-        if oi < MIN_OI_SOFT:
-            score -= 30
-            warnings.append(f"Almost no open interest ({oi}) - you may not get filled fairly")
-        elif oi < MIN_OPEN_INTEREST:
-            score -= 12
-            warnings.append(f"Thin open interest ({oi})")
-
-        if wide:
-            score -= 12
-            warnings.append(f"Wide bid/ask ({spread_pct*100:.0f}%) - use a limit order")
-
-        reg = regime_alignment(signal)
-        if reg.get("against_trend"):
-            score -= 15
-            warnings.append(f"Against the market trend ({reg.get('regime')})")
-
-        score = max(0, min(100, score))
+        qa = assess_quality(ticker, signal, expiry, iv, oi, wide, spread_pct,
+                            is_debit_spread=False)
+        score, warnings = qa["score"], qa["warnings"]
+        ivx, earn, reg = qa["iv"], qa["earnings"], qa["regime"]
 
         note = (f"Buy {strike:g}{kind[0]} @ ~${px:.2f} (delta {delta:.2f}). Max loss "
                 f"${px*100:.0f}/contract (the whole premium). If {ticker} reaches "
@@ -403,7 +429,7 @@ def build_long_option(ticker: str, signal: str, entry: float, target: float,
         return None
 
 
-def _bull_call_spread(calls, entry, target, dte, expiry, spot, risk_budget):
+def _bull_call_spread(calls, entry, target, dte, expiry, spot, risk_budget, ticker=""):
     calls = calls.sort_values("strike").reset_index(drop=True)
     if len(calls) < 2:
         return None
@@ -436,11 +462,19 @@ def _bull_call_spread(calls, entry, target, dte, expiry, spot, risk_budget):
     lev = round(stock_cost / cost, 1) if cost > 0 else 0
     spread_pct = round(max(_leg_spread_pct(long_row), _leg_spread_pct(short_row)), 3)
     wide = spread_pct > WIDE_MARKET_THRESHOLD
+    # Liquidity of a spread is only as good as its worst leg - you have to fill both.
+    oi_long, _, _ = _leg_liquidity(long_row)
+    oi_short, _, _ = _leg_liquidity(short_row)
+    oi = min(oi_long, oi_short)
+    delta = abs(_bs_delta(spot, long_k, dte, iv, "call"))
+
+    qa = assess_quality(ticker, "BUY", expiry, iv, oi, wide, spread_pct,
+                        is_debit_spread=True)
+    ivx, earn, reg = qa["iv"], qa["earnings"], qa["regime"]
 
     note = f"Buy {long_k:g}C / sell {short_k:g}C. Max loss ${net_debit*100:.0f}/contract, max gain ${max_profit*100:.0f}."
-    if wide:
-        note += (f" WIDE MARKET ({spread_pct*100:.0f}% bid/ask spread) - "
-                 "your real fill will likely be worse than this quote. Use a limit order.")
+    if qa["warnings"]:
+        note += " ⚠ " + "; ".join(qa["warnings"]) + "."
 
     return OptionsPlay(
         strategy="Bull Call Spread",
@@ -456,10 +490,17 @@ def _bull_call_spread(calls, entry, target, dte, expiry, spot, risk_budget):
         note=note,
         quoted_at=datetime.now().isoformat(timespec="seconds"),
         max_spread_pct=spread_pct, wide_market=wide,
+        open_interest=oi, illiquid=oi < MIN_OI_SOFT, delta=round(delta, 3),
+        iv_verdict=ivx["verdict"], iv_ratio=ivx["ratio"],
+        iv_expensive=bool(ivx["expensive"]),
+        earnings_date=earn["date"], earnings_in_hold=bool(earn["in_hold"]),
+        regime_aligned=bool(reg.get("aligned", True)),
+        against_trend=bool(reg.get("against_trend", False)),
+        warnings=qa["warnings"], quality_score=qa["score"],
     )
 
 
-def _bear_put_spread(puts, entry, target, dte, expiry, spot, risk_budget):
+def _bear_put_spread(puts, entry, target, dte, expiry, spot, risk_budget, ticker=""):
     puts = puts.sort_values("strike").reset_index(drop=True)
     if len(puts) < 2:
         return None
@@ -493,11 +534,18 @@ def _bear_put_spread(puts, entry, target, dte, expiry, spot, risk_budget):
     lev = round(stock_cost / cost, 1) if cost > 0 else 0
     spread_pct = round(max(_leg_spread_pct(long_row), _leg_spread_pct(short_row)), 3)
     wide = spread_pct > WIDE_MARKET_THRESHOLD
+    oi_long, _, _ = _leg_liquidity(long_row)
+    oi_short, _, _ = _leg_liquidity(short_row)
+    oi = min(oi_long, oi_short)   # you must fill both legs
+    delta = abs(_bs_delta(spot, long_k, dte, iv, "put"))
+
+    qa = assess_quality(ticker, "SELL", expiry, iv, oi, wide, spread_pct,
+                        is_debit_spread=True)
+    ivx, earn, reg = qa["iv"], qa["earnings"], qa["regime"]
 
     note = f"Buy {long_k:g}P / sell {short_k:g}P. Max loss ${net_debit*100:.0f}/contract, max gain ${max_profit*100:.0f}."
-    if wide:
-        note += (f" WIDE MARKET ({spread_pct*100:.0f}% bid/ask spread) - "
-                 "your real fill will likely be worse than this quote. Use a limit order.")
+    if qa["warnings"]:
+        note += " ⚠ " + "; ".join(qa["warnings"]) + "."
 
     return OptionsPlay(
         strategy="Bear Put Spread",
@@ -513,6 +561,13 @@ def _bear_put_spread(puts, entry, target, dte, expiry, spot, risk_budget):
         note=note,
         quoted_at=datetime.now().isoformat(timespec="seconds"),
         max_spread_pct=spread_pct, wide_market=wide,
+        open_interest=oi, illiquid=oi < MIN_OI_SOFT, delta=round(delta, 3),
+        iv_verdict=ivx["verdict"], iv_ratio=ivx["ratio"],
+        iv_expensive=bool(ivx["expensive"]),
+        earnings_date=earn["date"], earnings_in_hold=bool(earn["in_hold"]),
+        regime_aligned=bool(reg.get("aligned", True)),
+        against_trend=bool(reg.get("against_trend", False)),
+        warnings=qa["warnings"], quality_score=qa["score"],
     )
 
 

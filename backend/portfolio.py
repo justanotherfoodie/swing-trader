@@ -61,7 +61,17 @@ TIER2_PCT = 50            # second scale-out: sell ~half of what's left
 TIER3_PCT = 80            # close the runner entirely
 SINGLE_CT_TAKE_PCT = 30   # can't split 1 contract - just take the whole thing here
 TRAIL_ARM_PCT = 20        # once peaked at least this high, protect it
-TRAIL_GIVEBACK_PCT = 8    # ...and sell if it gives back this many points from peak
+# Giveback scales with the peak instead of being a flat 8 points. A fixed stop is
+# proportionally brutal on a small peak (21% -> out at 13%, which is ordinary noise)
+# and far too loose on a big one (80% -> out at 72%). Backtesting the flat version
+# showed it cutting a runner that went on to triple. Keep ~a third of the peak.
+TRAIL_GIVEBACK_FRAC = 0.35
+TRAIL_GIVEBACK_MIN = 10
+
+
+def trail_exit_level(peak_pct: float) -> float:
+    """The P&L level at which a trailing exit fires, given the best gain seen."""
+    return peak_pct - max(TRAIL_GIVEBACK_MIN, peak_pct * TRAIL_GIVEBACK_FRAC)
 
 # No single ticker may absorb more than this share of the budget. Concentration is the
 # fastest way to lose a small account: one gap-down on your only position is the account.
@@ -109,7 +119,11 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
     the next morning. So here we take the top `candidate_pool` signals per side and
     re-fetch a fresh option chain quote for each one right now.
     """
-    have_opts = [s for s in signals if s.get("options_play")]
+    # Signals that already carry a scan-time options quote are known to be optionable.
+    # Momentum signals arrive without one; make_draft re-quotes live anyway, so let it
+    # decide eligibility rather than excluding them up front.
+    have_opts = [s for s in signals
+                 if s.get("options_play") or s.get("source") == "momentum"]
     buys  = [s for s in have_opts if s["signal"] == "BUY"]
     sells = [s for s in have_opts if s["signal"] == "SELL"]
 
@@ -161,8 +175,9 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
             "confidence": s["confidence"],
             # Which of the 5 strategies actually fired - the key the journal groups by.
             "strategies": [b["name"] for b in s.get("strategy_breakdown", [])
-                           if b.get("score")],
+                           if b.get("score")] or ([s["source"]] if s.get("source") else []),
             "triggers": s.get("triggers", []),
+            "source": s.get("source", "swing"),
             "wide_market": op.get("wide_market", False),
             "max_spread_pct": op.get("max_spread_pct", 0),
             "quality_score": op.get("quality_score", 100),
@@ -256,10 +271,11 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
         note += (f" Note: {', '.join(wide_tickers)} has a wide bid/ask spread - "
                  "use a limit order, your fill may differ from the quote below.")
 
-    from signals.context import market_regime
+    from signals.context import market_regime, premium_buying_environment
     return {
         "budget": budget,
         "items": items,
+        "environment": premium_buying_environment(),
         "total_cost": round(cash, 2),
         "cash_left": round(budget - cash, 2),
         "n_call_contracts": n_calls,
@@ -560,7 +576,7 @@ def _evaluate_one(p: dict) -> dict:
     # Which ladder rungs have already been taken on this position.
     done = set(p.get("scaled_out", []))
     trailing = (peak_pnl_pct >= TRAIL_ARM_PCT
-                and pnl_pct <= peak_pnl_pct - TRAIL_GIVEBACK_PCT)
+                and pnl_pct <= trail_exit_level(peak_pnl_pct))
 
     sell_contracts = contracts   # default: exit everything
 
@@ -612,7 +628,7 @@ def _evaluate_one(p: dict) -> dict:
                      (TIER1_PCT if "t1" not in done else TIER2_PCT))
         if peak_pnl_pct >= TRAIL_ARM_PCT and pnl_pct < peak_pnl_pct:
             reason = (f"Hold, but watch it — peaked at +{peak_pnl_pct:.0f}%, now +{pnl_pct:.0f}%. "
-                      f"Flags SELL if it slips to +{peak_pnl_pct - TRAIL_GIVEBACK_PCT:.0f}%.")
+                      f"Flags SELL if it slips to +{trail_exit_level(peak_pnl_pct):.0f}%.")
         elif pnl_pct > 0:
             reason = (f"Hold — up {pnl_pct:.0f}%, {days_held}d held, {dte}d to expiry. "
                       f"Next action at +{next_rung:.0f}%.")

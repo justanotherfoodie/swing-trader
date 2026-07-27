@@ -115,6 +115,33 @@ def status():
 class PlanRequest(BaseModel):
     budget: float = 600.0
     picks_per_side: int = 2
+    structure: str = "single"
+    source: str = "both"      # swing | momentum | both
+
+
+def _momentum_as_signals() -> list[dict]:
+    """Reshape momentum results into the signal shape build_plan expects.
+
+    Without this the momentum scanner is a read-only curiosity: it finds strong
+    short-term setups you then have no way to actually trade through the planner.
+    """
+    out = []
+    for m in _momentum_cache.get("signals", []):
+        conf = m["confidence"]
+        out.append({
+            "ticker": m["ticker"],
+            "signal": m["signal"],
+            "entry": m["entry"],
+            "take_profit_1": m["target"],
+            "stop_loss": m["stop_loss"],
+            "confidence": conf,
+            "quality": "high" if conf >= 70 else "medium" if conf >= 50 else "low",
+            "strategy_breakdown": [{"name": "Short-Term Momentum",
+                                    "score": m["score"], "reason": "; ".join(m["reasons"][:2])}],
+            "triggers": m["reasons"][:2],
+            "source": "momentum",
+        })
+    return out
 
 
 class OpenRequest(BaseModel):
@@ -123,9 +150,18 @@ class OpenRequest(BaseModel):
 
 @app.post("/api/plan")
 def options_plan(req: PlanRequest):
-    """After a scan, return a budget-allocated shopping list of option spreads to buy."""
-    signals = get_last_scan().get("signals", [])
-    return portfolio.build_plan(req.budget, signals, req.picks_per_side)
+    """After a scan, return a budget-allocated shopping list of options to buy."""
+    signals: list[dict] = []
+    if req.source in ("swing", "both"):
+        for s in get_last_scan().get("signals", []):
+            signals.append({**s, "source": "swing"})
+    if req.source in ("momentum", "both"):
+        have = {s["ticker"] for s in signals}
+        # A ticker flagged by BOTH engines is confluence - keep the swing entry (it has
+        # the full strategy breakdown) rather than duplicating the position.
+        signals += [m for m in _momentum_as_signals() if m["ticker"] not in have]
+    return portfolio.build_plan(req.budget, signals, req.picks_per_side,
+                                structure=req.structure)
 
 
 @app.post("/api/positions")

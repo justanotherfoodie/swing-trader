@@ -219,6 +219,147 @@ def market_regime() -> dict:
     return val
 
 
+def macro_from_market() -> tuple[float, str]:
+    """Macro score (-2..+2) derived from PRICE, not headlines.
+
+    The news-based macro score was permanently 0.0 because it needs a paid news API key,
+    leaving a whole scoring input inert. Volatility and index trend are free, always
+    available, and arguably more honest: VIX is the market pricing its own fear in real
+    money rather than a model's reading of journalism.
+
+    Inputs: VIX level, VIX 5-day direction, and SPY's position relative to its 50/200 EMA.
+    """
+    def fetch():
+        score = 0.0
+        bits: list[str] = []
+        try:
+            vix = yf.Ticker("^VIX").history(period="3mo")
+            if vix is not None and not vix.empty:
+                v = float(vix["Close"].iloc[-1])
+                v5 = float(vix["Close"].iloc[-6]) if len(vix) > 6 else v
+                if v < 15:
+                    score += 1.0
+                    bits.append(f"VIX {v:.1f} (calm)")
+                elif v < 20:
+                    score += 0.3
+                    bits.append(f"VIX {v:.1f} (normal)")
+                elif v < 28:
+                    score -= 0.7
+                    bits.append(f"VIX {v:.1f} (elevated)")
+                else:
+                    score -= 1.5
+                    bits.append(f"VIX {v:.1f} (fear)")
+                chg = (v - v5) / v5 * 100 if v5 else 0
+                if chg > 15:
+                    score -= 0.5
+                    bits.append(f"VIX +{chg:.0f}% in a week (risk-off)")
+                elif chg < -15:
+                    score += 0.4
+                    bits.append(f"VIX {chg:.0f}% in a week (risk-on)")
+        except Exception:
+            pass
+
+        r = market_regime()
+        score += r.get("bias", 0.0) * 0.8
+        if r.get("regime") != "unknown":
+            bits.append(r["regime"].replace("_", " "))
+
+        score = max(-2.0, min(2.0, score))
+        label = ("risk-on" if score >= 0.8 else "mildly positive" if score > 0.2
+                 else "neutral" if score > -0.2 else
+                 "cautious" if score > -0.8 else "risk-off")
+        return round(score, 2), f"{label.capitalize()} — {', '.join(bits)}." if bits else label
+
+    now = time.time()
+    hit = _cache.get("macro_mkt")
+    if hit and now - hit["ts"] < 1800:
+        return hit["val"]
+    val = fetch()
+    _cache["macro_mkt"] = {"val": val, "ts": now}
+    return val
+
+
+def premium_buying_environment() -> dict:
+    """Is this a market where BUYING directional options can work at all?
+
+    This exists because backtesting the strategy across five separate windows in a
+    choppy, low-volatility, slightly-down tape produced a loss in every single one -
+    with both long options and spreads. That is not a bug in the signals; it is what
+    buying premium does when the index grinds sideways at 14% realized vol. Every day
+    you hold, theta takes a bite, and the move you paid for never arrives.
+
+    Long options need one of two things: an index that TRENDS (so directional bets
+    follow through) or volatility that EXPANDS after entry (so premium reprices up).
+    Sideways chop at low vol is the one environment that reliably bleeds them.
+
+    Returns a favourability read so the app can tell you to sit out rather than
+    quietly feeding a losing setup.
+    """
+    def fetch():
+        try:
+            spy = yf.Ticker("SPY").history(period="6mo")
+            if spy is None or spy.empty or len(spy) < 60:
+                return {"favourable": True, "score": 0, "note": "", "trend_pct": None,
+                        "realized_vol": None, "chop": None}
+
+            c = spy["Close"]
+            r = np.log(c / c.shift(1)).dropna()
+            rv20 = float(r.tail(20).std() * np.sqrt(252))
+            trend_20 = float((c.iloc[-1] / c.iloc[-21] - 1) * 100) if len(c) > 21 else 0.0
+
+            # Chop measure: net movement vs total distance travelled. Near 0 = pure
+            # round-tripping (bad for directional premium); near 1 = clean trend.
+            window = c.tail(21)
+            path = float(window.diff().abs().sum())
+            net = float(abs(window.iloc[-1] - window.iloc[0]))
+            efficiency = (net / path) if path > 0 else 0.0
+
+            score = 0
+            bits = []
+            if abs(trend_20) >= 3:
+                score += 1
+                bits.append(f"index trending {trend_20:+.1f}% over a month")
+            else:
+                score -= 1
+                bits.append(f"index going nowhere ({trend_20:+.1f}% in a month)")
+
+            if efficiency >= 0.35:
+                score += 1
+                bits.append(f"clean directional movement (efficiency {efficiency:.2f})")
+            else:
+                score -= 1
+                bits.append(f"choppy, round-tripping price action (efficiency {efficiency:.2f})")
+
+            if rv20 >= 0.18:
+                score += 1
+                bits.append(f"volatility {rv20*100:.0f}% gives moves room")
+            elif rv20 < 0.13:
+                score -= 1
+                bits.append(f"volatility only {rv20*100:.0f}% - small moves, theta wins")
+
+            favourable = score >= 0
+            headline = ("Reasonable conditions for buying options."
+                        if favourable else
+                        "POOR conditions for buying options - consider sitting out or "
+                        "trading much smaller.")
+            return {"favourable": favourable, "score": score,
+                    "note": f"{headline} " + "; ".join(bits) + ".",
+                    "trend_pct": round(trend_20, 2),
+                    "realized_vol": round(rv20 * 100, 1),
+                    "chop": round(efficiency, 2)}
+        except Exception:
+            return {"favourable": True, "score": 0, "note": "", "trend_pct": None,
+                    "realized_vol": None, "chop": None}
+
+    now = time.time()
+    hit = _cache.get("premium_env")
+    if hit and now - hit["ts"] < 3600:
+        return hit["val"]
+    val = fetch()
+    _cache["premium_env"] = {"val": val, "ts": now}
+    return val
+
+
 def regime_alignment(signal: str) -> dict:
     """Is this trade with or against the index trend?"""
     r = market_regime()

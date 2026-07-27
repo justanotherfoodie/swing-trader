@@ -68,9 +68,15 @@ def run_scan(max_tickers: int = 1200, top_n: int = 25) -> dict:
     print("[scanner] Starting market scan...")
     t0 = time.time()
 
-    # Step 1: Macro sentiment
+    # Step 1: Macro sentiment. Prefer the news+LLM read when keys are configured;
+    # otherwise fall back to a market-derived score (VIX + index trend) so this input
+    # is live rather than a permanent 0.0.
     macro_headlines = get_macro_news()
     macro_score, macro_summary = score_macro_sentiment(macro_headlines)
+    if macro_score == 0.0 and not macro_headlines:
+        from signals.context import macro_from_market
+        macro_score, macro_summary = macro_from_market()
+        macro_summary = f"{macro_summary} (from market data - no news API key)"
     print(f"[scanner] Macro score: {macro_score:.2f} - {macro_summary[:80]}")
 
     # Step 2: Score all tickers

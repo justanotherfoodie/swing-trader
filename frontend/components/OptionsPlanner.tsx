@@ -146,6 +146,24 @@ export function OptionsPlanner() {
               </div>
             )}
           </div>
+          {/* Environment check — the single most useful thing the app can say is
+              "today is a bad day to buy premium at all". */}
+          {plan.environment && !plan.environment.favourable && (
+            <div style={{ fontSize: 12, color: "#ffb3c0", background: "rgba(255,77,109,0.1)", border: "1px solid rgba(255,77,109,0.35)", borderRadius: 6, padding: "10px 12px", marginBottom: 10, lineHeight: 1.55 }}>
+              <b style={{ color: "#ff4d6d" }}>⛔ Poor conditions for buying options.</b>{" "}
+              {plan.environment.note.replace("POOR conditions for buying options - consider sitting out or trading much smaller. ", "")}
+              <div style={{ marginTop: 4, color: "#94a3b8" }}>
+                Long options need a trending index or expanding volatility. Sideways chop
+                bleeds them via time decay regardless of how good the signal looks. Consider
+                sitting out or trading much smaller today.
+              </div>
+            </div>
+          )}
+          {plan.environment?.favourable && (
+            <div style={{ fontSize: 11, color: "#00c896", marginBottom: 8 }}>
+              ✓ {plan.environment.note}
+            </div>
+          )}
           {plan.regime && (
             <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid #1e2330" }}>
               <b style={{ color: plan.regime.bias > 0 ? "#00c896" : plan.regime.bias < 0 ? "#ff4d6d" : "#f5a623" }}>

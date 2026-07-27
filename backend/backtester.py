@@ -35,7 +35,8 @@ import pandas as pd
 from data.fetcher import get_ohlcv
 from data.universe import get_universe
 from signals.scorer import score_ticker
-from signals.options import value_vertical, round_to_strike, strike_increment
+from signals.options import (value_vertical, round_to_strike, strike_increment,
+                             black_scholes)
 
 ENTRY_DTE = 35  # assume a ~35-day option is bought at entry
 
@@ -49,9 +50,14 @@ def realized_iv(closes: pd.Series, window: int = 20) -> float:
     return max(0.10, min(2.0, iv))  # clamp to sane bounds
 
 
-def build_spread_strikes(signal: str, entry: float, target: float):
-    """Pick listed-style long/short strikes for the spread."""
+def build_spread_strikes(signal: str, entry: float, target: float, structure: str = "spread"):
+    """Pick listed-style strikes. `structure="single"` returns short_k=None (long option)."""
     inc = strike_increment(entry)
+    kind = "call" if signal == "BUY" else "put"
+    if structure == "single":
+        # Mirror the live engine: a slightly ITM strike (~0.6 delta) rather than ATM.
+        long_k = round_to_strike(entry * (0.97 if kind == "call" else 1.03))
+        return long_k, None, kind
     long_k = round_to_strike(entry)
     if signal == "BUY":  # bull call: short above long, near target
         short_k = round_to_strike(target)
@@ -63,6 +69,72 @@ def build_spread_strikes(signal: str, entry: float, target: float):
         if short_k >= long_k:
             short_k = long_k - inc
         return long_k, short_k, "put"
+
+
+def simulate_with_ladder(df, entry_date, exit_date, long_k, short_k, kind, iv,
+                         entry_debit, entry_dte, contracts):
+    """Walk the position forward day by day, applying the live profit ladder.
+
+    The old backtest just held to a fixed exit date, which measures the signal but not
+    the strategy: the real system scales out at +25%/+50%, trails a peak, and cuts at
+    -40%. Replaying those rules against the actual price path is the only way to know
+    whether the exit logic helps or hurts.
+    """
+    from portfolio import (TIER1_PCT, TIER2_PCT, TIER3_PCT, SINGLE_CT_TAKE_PCT,
+                           TRAIL_ARM_PCT, trail_exit_level, STOP_LOSS_PCT)
+
+    path = df[(df.index > entry_date) & (df.index <= exit_date)]
+    remaining = contracts
+    realized = 0.0
+    peak_pct = 0.0
+    rungs: set[str] = set()
+    events: list[str] = []
+    days = 0
+
+    for ts, bar in path.iterrows():
+        days += 1
+        spot = float(bar["close"])
+        dte = max(0, entry_dte - days)
+        val = value_vertical(spot, long_k, short_k, dte, iv, kind) if short_k is not None \
+            else black_scholes(spot, long_k, dte, iv, kind)
+        pnl_pct = (val - entry_debit) / entry_debit * 100 if entry_debit else 0
+        peak_pct = max(peak_pct, pnl_pct)
+
+        def bank(n, why):
+            nonlocal remaining, realized
+            n = min(n, remaining)
+            if n <= 0:
+                return
+            realized += (val - entry_debit) * 100 * n
+            remaining -= n
+            events.append(f"d{days} {why} {n}ct @ {pnl_pct:+.0f}%")
+
+        if pnl_pct <= -STOP_LOSS_PCT * 100:
+            bank(remaining, "STOP")
+        elif peak_pct >= TRAIL_ARM_PCT and pnl_pct <= trail_exit_level(peak_pct):
+            bank(remaining, "TRAIL")
+        elif pnl_pct >= TIER3_PCT:
+            bank(remaining, "TIER3")
+        elif contracts == 1 and pnl_pct >= SINGLE_CT_TAKE_PCT:
+            bank(remaining, "TAKE")
+        elif contracts >= 2 and pnl_pct >= TIER2_PCT and "t2" not in rungs:
+            rungs.add("t2"); bank(max(1, remaining // 2), "TIER2")
+        elif contracts >= 2 and pnl_pct >= TIER1_PCT and "t1" not in rungs:
+            rungs.add("t1"); bank(contracts // 2, "TIER1")
+
+        if remaining <= 0:
+            break
+
+    # Anything still open is marked out at the final bar.
+    if remaining > 0 and len(path):
+        spot = float(path["close"].iloc[-1])
+        dte = max(0, entry_dte - days)
+        val = value_vertical(spot, long_k, short_k, dte, iv, kind) if short_k is not None \
+            else black_scholes(spot, long_k, dte, iv, kind)
+        realized += (val - entry_debit) * 100 * remaining
+        events.append(f"d{days} EXPIRE-EXIT {remaining}ct @ "
+                      f"{(val-entry_debit)/entry_debit*100 if entry_debit else 0:+.0f}%")
+    return round(realized, 2), events, round(peak_pct, 1)
 
 
 class Position:
@@ -87,7 +159,7 @@ class Position:
 
 
 def run_backtest(budget=600.0, hold_days=5, as_of=None, max_tickers=900,
-                 picks_per_side=1):
+                 picks_per_side=1, structure="single"):
     print(f"\n{'='*64}")
     print(f"  OPTIONS STRATEGY BACKTEST  —  budget ${budget:,.0f}")
     print(f"{'='*64}")
@@ -163,14 +235,17 @@ def run_backtest(budget=600.0, hold_days=5, as_of=None, max_tickers=900,
     # Build positions and allocate budget by confidence weight.
     drafts = []
     for sig, entry_spot, exit_spot, iv in chosen:
-        long_k, short_k, kind = build_spread_strikes(sig.signal, entry_spot, sig.take_profit_1)
-        entry_debit = value_vertical(entry_spot, long_k, short_k, ENTRY_DTE, iv, kind)
+        long_k, short_k, kind = build_spread_strikes(sig.signal, entry_spot,
+                                                     sig.take_profit_1, structure)
+        entry_debit = (value_vertical(entry_spot, long_k, short_k, ENTRY_DTE, iv, kind)
+                       if short_k is not None
+                       else black_scholes(entry_spot, long_k, ENTRY_DTE, iv, kind))
         if entry_debit <= 0.01:
             continue
         drafts.append((sig, entry_spot, exit_spot, iv, long_k, short_k, kind, entry_debit))
 
     if not drafts:
-        print("No tradeable spreads could be constructed.")
+        print("No tradeable positions could be constructed.")
         return
 
     # Rank drafts (best first) and build Position objects with 0 contracts.
@@ -181,7 +256,12 @@ def run_backtest(budget=600.0, hold_days=5, as_of=None, max_tickers=900,
         pos = Position(sig.ticker, sig.signal, kind, long_k, short_k,
                        round(entry_debit, 2), 0, entry_spot, sig.take_profit_1)
         pos.exit_spot = exit_spot
-        pos.exit_value = round(value_vertical(exit_spot, long_k, short_k, exit_dte, iv, kind), 2)
+        pos.exit_value = round(
+            value_vertical(exit_spot, long_k, short_k, exit_dte, iv, kind)
+            if short_k is not None
+            else black_scholes(exit_spot, long_k, exit_dte, iv, kind), 2)
+        pos.iv = iv
+        pos.df = data[sig.ticker]
         positions.append(pos)
 
     # Balanced allocation: seed 1 contract of each pick (best first) to keep the
@@ -207,45 +287,62 @@ def run_backtest(budget=600.0, hold_days=5, as_of=None, max_tickers=900,
 
     positions = [p for p in positions if p.contracts > 0]
     if not positions:
-        print(f"Budget ${budget:.0f} too small for any spread at current prices.")
+        print(f"Budget ${budget:.0f} too small for any position at current prices.")
         return
-    for p in positions:
-        p.pnl = round((p.exit_value - p.entry_debit) * 100 * p.contracts, 2)
 
-    _print_report(positions, budget, cash_used, entry_date, exit_date)
+    # P&L two ways: buy-and-hold to the exit date vs the live profit ladder replayed
+    # over the same price path. The difference IS the value of the exit logic.
+    for p in positions:
+        p.hold_pnl = round((p.exit_value - p.entry_debit) * 100 * p.contracts, 2)
+        p.pnl, p.events, p.peak = simulate_with_ladder(
+            p.df, entry_date, exit_date, p.long_k, p.short_k, p.kind, p.iv,
+            p.entry_debit, ENTRY_DTE, p.contracts)
+
+    _print_report(positions, budget, cash_used, entry_date, exit_date, structure)
     return positions
 
 
-def _print_report(positions, budget, cash_used, entry_date, exit_date):
+def _print_report(positions, budget, cash_used, entry_date, exit_date, structure="spread"):
     calls = [p for p in positions if p.kind == "call"]
     puts = [p for p in positions if p.kind == "put"]
 
     def line(p):
         move = (p.exit_spot - p.entry_spot) / p.entry_spot * 100
-        return (f"  {p.ticker:6} {p.kind.upper()} {p.long_k:g}/{p.short_k:g}  "
-                f"x{p.contracts:>2}ct  entry ${p.entry_debit*100:6.0f}/ct  "
-                f"exit ${p.exit_value*100:6.0f}/ct  stock {move:+5.1f}%  "
-                f"P&L {'+' if p.pnl>=0 else ''}{p.pnl:,.0f}")
+        strikes = f"{p.long_k:g}" if p.short_k is None else f"{p.long_k:g}/{p.short_k:g}"
+        return (f"  {p.ticker:6} {p.kind.upper()} {strikes:12} x{p.contracts:>2}ct  "
+                f"stock {move:+5.1f}%  peak {p.peak:+5.0f}%  "
+                f"ladder {'+' if p.pnl >= 0 else ''}{p.pnl:>7,.0f}  "
+                f"(hold {'+' if p.hold_pnl >= 0 else ''}{p.hold_pnl:,.0f})\n"
+                f"         {' | '.join(p.events) if p.events else 'no exits triggered'}")
 
-    print("CALL SPREADS (bullish):")
+    label = "LONG CALLS" if structure == "single" else "CALL SPREADS"
+    plabel = "LONG PUTS" if structure == "single" else "PUT SPREADS"
+    print(f"{label} (bullish):")
     print("\n".join(line(p) for p in calls) if calls else "  (none)")
-    print("\nPUT SPREADS (bearish):")
+    print(f"\n{plabel} (bearish):")
     print("\n".join(line(p) for p in puts) if puts else "  (none)")
 
     total_call_ct = sum(p.contracts for p in calls)
     total_put_ct = sum(p.contracts for p in puts)
     total_pnl = sum(p.pnl for p in positions)
+    hold_pnl = sum(p.hold_pnl for p in positions)
     wins = sum(1 for p in positions if p.pnl > 0)
 
-    print(f"\n{'-'*64}")
-    print(f"  Contracts:  {total_call_ct} call-spread  +  {total_put_ct} put-spread")
+    print(f"\n{'-'*72}")
+    print(f"  Contracts:  {total_call_ct} call  +  {total_put_ct} put")
     print(f"  Capital deployed: ${cash_used:,.0f} / ${budget:,.0f} "
           f"(cash left ${budget-cash_used:,.0f})")
     ret = (total_pnl / cash_used * 100) if cash_used else 0
-    print(f"  TOTAL P&L: {'+' if total_pnl>=0 else ''}${total_pnl:,.2f}   "
-          f"({'+' if ret>=0 else ''}{ret:.1f}% on deployed capital)")
+    hret = (hold_pnl / cash_used * 100) if cash_used else 0
+    print(f"  WITH PROFIT LADDER: {'+' if total_pnl>=0 else ''}${total_pnl:,.2f}  "
+          f"({'+' if ret>=0 else ''}{ret:.1f}%)")
+    print(f"  Buy & hold to exit: {'+' if hold_pnl>=0 else ''}${hold_pnl:,.2f}  "
+          f"({'+' if hret>=0 else ''}{hret:.1f}%)")
+    edge = total_pnl - hold_pnl
+    print(f"  Ladder edge:        {'+' if edge>=0 else ''}${edge:,.2f}  "
+          f"<- what the exit rules added/cost")
     print(f"  Win rate: {wins}/{len(positions)}")
-    print(f"{'-'*64}")
+    print(f"{'-'*72}")
     print("  NOTE: Hypothetical. Black-Scholes with realized-vol IV held constant,")
     print("  no commissions/slippage. Real option fills will differ. Not advice.\n")
 
@@ -257,7 +354,10 @@ if __name__ == "__main__":
     ap.add_argument("--as-of", type=str, default=None, help="Entry date YYYY-MM-DD")
     ap.add_argument("--max-tickers", type=int, default=900)
     ap.add_argument("--picks-per-side", type=int, default=2,
-                    help="How many call-spread and put-spread positions to take")
+                    help="How many bullish and bearish positions to take")
+    ap.add_argument("--structure", choices=["single", "spread"], default="single",
+                    help="single = long calls/puts (what the live app trades); spread = verticals")
     args = ap.parse_args()
     run_backtest(budget=args.budget, hold_days=args.hold_days, as_of=args.as_of,
-                 max_tickers=args.max_tickers, picks_per_side=args.picks_per_side)
+                 max_tickers=args.max_tickers, picks_per_side=args.picks_per_side,
+                 structure=args.structure)
