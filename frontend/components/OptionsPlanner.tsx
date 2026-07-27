@@ -146,8 +146,19 @@ export function OptionsPlanner() {
               </div>
             )}
           </div>
+          {plan.regime && (
+            <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid #1e2330" }}>
+              <b style={{ color: plan.regime.bias > 0 ? "#00c896" : plan.regime.bias < 0 ? "#ff4d6d" : "#f5a623" }}>
+                Market: {plan.regime.regime.replace("_", " ")}
+              </b>{" "}
+              — {plan.regime.note}
+            </div>
+          )}
           {plan.items.length === 0 ? (
-            <div style={{ color: "#6b7280", fontSize: 13 }}>No affordable spreads for this budget right now.</div>
+            <div style={{ color: "#6b7280", fontSize: 13 }}>
+              No trades cleared the quality filters at this budget. That is a result, not a
+              failure — see what was rejected below.
+            </div>
           ) : (
             <>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -167,6 +178,24 @@ export function OptionsPlanner() {
                 </button>
               </div>
             </>
+          )}
+
+          {/* Why the plan is quiet — rejected setups, so a short list is explained
+              rather than looking like the scanner found nothing. */}
+          {!!plan.rejected?.length && (
+            <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid #1e2330" }}>
+              <div style={{ fontSize: 10.5, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+                Filtered out ({plan.rejected.length}) — good direction, bad contract
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                {plan.rejected.map((r) => (
+                  <div key={r.ticker} style={{ fontSize: 11, color: "#64748b" }}>
+                    <b style={{ color: "#94a3b8" }}>{r.ticker}</b>{" "}
+                    <span style={{ color: "#ff4d6d" }}>Q{r.quality_score}</span> — {r.warnings.join("; ")}
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -192,6 +221,30 @@ export function OptionsPlanner() {
               />
             ))}
           </div>
+
+          {/* Feedback loop: which strategies actually made money. Builds up as you
+              close trades — the only honest measure of the engine's edge. */}
+          {!!perf?.by_strategy?.length && (
+            <div style={{ marginTop: 14, paddingTop: 10, borderTop: "1px solid #1e2330" }}>
+              <div style={{ fontSize: 10.5, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+                What&apos;s actually working ({perf.tracked_pnl_count} closed trades)
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                {perf.by_strategy.slice(0, 6).map((a) => (
+                  <div key={a.key} style={{ display: "flex", gap: 10, fontSize: 11, alignItems: "center" }}>
+                    <span style={{ color: "#94a3b8", minWidth: 190 }}>{a.key}</span>
+                    <span style={{ color: a.total_pnl >= 0 ? "#00c896" : "#ff4d6d", fontWeight: 700, minWidth: 70 }}>
+                      {a.total_pnl >= 0 ? "+" : ""}${a.total_pnl}
+                    </span>
+                    <span style={{ color: "#6b7280" }}>
+                      {a.trades} trade{a.trades !== 1 ? "s" : ""} · {a.win_rate}% win · avg{" "}
+                      {a.avg_pnl >= 0 ? "+" : ""}${a.avg_pnl}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -200,9 +253,12 @@ export function OptionsPlanner() {
 
 function PlanRow({ it }: { it: PlanItem }) {
   const c = it.kind === "call" ? "#00c896" : "#ff4d6d";
+  const q = it.quality_score ?? 100;
+  const qc = q >= 75 ? "#00c896" : q >= 50 ? "#f5a623" : "#ff4d6d";
+  const warns = it.warnings ?? [];
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, flexWrap: "wrap" }}>
         <span style={{ fontSize: 11, fontWeight: 700, color: c, background: `${c}1a`, border: `1px solid ${c}44`, borderRadius: 4, padding: "1px 7px", minWidth: 78, textAlign: "center" }}>
           {it.contracts}× {it.kind === "call" ? "CALL" : "PUT"}
         </span>
@@ -213,18 +269,35 @@ function PlanRow({ it }: { it: PlanItem }) {
             : `$${it.long_strike}/$${it.short_strike} spread`}{" "}
           · exp {it.expiry}
         </span>
-        {it.wide_market && (
-          <span style={{ fontSize: 10, fontWeight: 700, color: "#f5a623", background: "rgba(245,166,35,0.12)", border: "1px solid rgba(245,166,35,0.4)", borderRadius: 4, padding: "1px 6px" }}>
-            ⚠ WIDE MARKET
+        <span
+          title="Trade quality after IV, earnings, liquidity and trend checks"
+          style={{ fontSize: 10, fontWeight: 800, color: qc, background: `${qc}1a`, border: `1px solid ${qc}55`, borderRadius: 4, padding: "1px 6px" }}
+        >
+          Q{q}
+        </span>
+        {it.delta != null && it.delta > 0 && (
+          <span style={{ fontSize: 10, color: "#6b7280" }} title="Option delta — how much it moves per $1 of stock">
+            Δ{it.delta.toFixed(2)}
+          </span>
+        )}
+        {it.iv_verdict && (
+          <span
+            title={`Implied vol vs the stock's actual movement${it.iv_ratio ? ` (${it.iv_ratio}x)` : ""}`}
+            style={{
+              fontSize: 10,
+              color: it.iv_verdict.includes("rich") ? "#f5a623" : it.iv_verdict === "cheap" ? "#00c896" : "#6b7280",
+            }}
+          >
+            IV {it.iv_verdict.replace("_", " ")}
           </span>
         )}
         <span style={{ marginLeft: "auto", color: "#6b7280", fontSize: 12 }}>
           cost <b style={{ color: "#e2e8f0" }}>${it.cost.toLocaleString()}</b> · max gain <span style={{ color: "#00c896" }}>${it.max_gain_total.toLocaleString()}</span> · POP {it.prob_profit}%
         </span>
       </div>
-      {it.wide_market && (
-        <div style={{ fontSize: 11, color: "#f5a623", marginTop: 3, marginLeft: 88 }}>
-          Bid/ask spread is {((it.max_spread_pct || 0) * 100).toFixed(0)}% wide — use a limit order, your fill will likely differ from this quote.
+      {warns.length > 0 && (
+        <div style={{ fontSize: 11, color: "#f5a623", marginTop: 3, marginLeft: 88, lineHeight: 1.5 }}>
+          ⚠ {warns.join(" · ")}
         </div>
       )}
     </div>

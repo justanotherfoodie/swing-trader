@@ -53,6 +53,20 @@ class OptionsPlay:
     quoted_at: str = ""       # ISO timestamp this quote was fetched
     max_spread_pct: float = 0.0   # widest leg bid/ask spread as % of mid (liquidity gauge)
     wide_market: bool = False     # True if a leg's spread is wide enough that fills will slip
+    # --- trade-quality gates (see signals/context.py for the reasoning) ---
+    open_interest: int = 0        # contracts outstanding at the chosen strike
+    strike_volume: int = 0        # contracts traded today at that strike
+    illiquid: bool = False        # too thin to enter and exit cleanly
+    delta: float = 0.0            # option delta (0-1); how much it moves per $1 of stock
+    iv_verdict: str = ""          # cheap | fair | rich | very_rich
+    iv_ratio: float | None = None # implied vol / realized vol
+    iv_expensive: bool = False
+    earnings_date: str | None = None
+    earnings_in_hold: bool = False
+    regime_aligned: bool = True
+    against_trend: bool = False
+    warnings: list = None         # human-readable reasons to think twice
+    quality_score: int = 100      # 0-100 after penalties; low = skip it
 
 
 def _norm_cdf(x: float) -> float:
@@ -144,6 +158,43 @@ def _leg_price(row, side: str) -> float:
 
 WIDE_MARKET_THRESHOLD = 0.20  # a leg's (ask-bid)/mid beyond this means real slippage vs our quote
 
+# A strike with a handful of contracts outstanding has no real market: you are the only
+# participant, so you pay up to get in and give it back to get out. Seen live on this
+# account - VRSN open interest 3, JEF 1. Those fills are where returns quietly disappear.
+MIN_OPEN_INTEREST = 100
+MIN_OI_SOFT = 25              # below this it is unusable; between the two it is a warning
+
+# Directional longs want a strike that actually tracks the stock. Deep OTM options are
+# lottery tickets (tiny delta, all theta); deep ITM ties up capital for little leverage.
+# ~0.55-0.70 delta is the sweet spot: real participation in the move, manageable decay.
+TARGET_DELTA = 0.62
+DELTA_MIN, DELTA_MAX = 0.45, 0.80
+
+
+def _bs_delta(spot: float, strike: float, dte: int, iv: float, kind: str) -> float:
+    """Black-Scholes delta - how much the option moves per $1 move in the stock."""
+    if dte <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        intrinsic = (spot > strike) if kind == "call" else (spot < strike)
+        return 1.0 if intrinsic else 0.0
+    T = dte / 365.0
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * math.sqrt(T))
+    nd1 = _norm_cdf(d1)
+    return nd1 if kind == "call" else nd1 - 1.0
+
+
+def _leg_liquidity(row) -> tuple[int, int, bool]:
+    """(open_interest, volume, is_illiquid) for a chosen strike."""
+    try:
+        oi = int(float(row.get("openInterest") or 0))
+    except Exception:
+        oi = 0
+    try:
+        v = row.get("volume")
+        vol = 0 if v is None or (isinstance(v, float) and math.isnan(v)) else int(float(v))
+    except Exception:
+        vol = 0
+    return oi, vol, oi < MIN_OI_SOFT
+
 
 def _leg_spread_pct(row) -> float:
     """(ask-bid)/mid for one leg. Large values mean the quote won't hold at fill time -
@@ -218,14 +269,40 @@ def build_long_option(ticker: str, signal: str, entry: float, target: float,
         return None
 
     try:
+        from .context import iv_assessment, earnings_check, regime_alignment
+
         is_call = signal == "BUY"
         df = (chain.calls if is_call else chain.puts).sort_values("strike").reset_index(drop=True)
         if df.empty:
             return None
 
-        want = entry * moneyness if is_call else entry * (2 - moneyness)
-        row = _nearest(df, want)
-        strike = float(row["strike"])
+        kind_l = "call" if is_call else "put"
+
+        # --- Strike selection by DELTA, not by raw moneyness ---------------------
+        # Pick the strike whose delta is closest to TARGET_DELTA, restricted to a sane
+        # band, and prefer liquid strikes when deltas are close. Falls back to the old
+        # at-the-money pick if the chain has no usable implied vols.
+        cands = []
+        for _, r in df.iterrows():
+            k = float(r["strike"])
+            riv = float(r.get("impliedVolatility") or 0)
+            if riv <= 0 or k <= 0:
+                continue
+            d = abs(_bs_delta(entry, k, dte, riv, kind_l))
+            if DELTA_MIN <= d <= DELTA_MAX:
+                oi, vol, thin = _leg_liquidity(r)
+                cands.append((abs(d - TARGET_DELTA), thin, -oi, k, r, d))
+        if cands:
+            # closest delta first; among near-ties prefer the liquid one
+            cands.sort(key=lambda c: (round(c[0], 2), c[1], c[2]))
+            _, _, _, strike, row, delta = cands[0]
+        else:
+            want = entry * moneyness if is_call else entry * (2 - moneyness)
+            row = _nearest(df, want)
+            strike = float(row["strike"])
+            delta = abs(_bs_delta(entry, strike, dte,
+                                  float(row.get("impliedVolatility") or 0), kind_l))
+
         px = _leg_price(row, "buy")
         if px <= 0:
             return None
@@ -246,11 +323,54 @@ def build_long_option(ticker: str, signal: str, entry: float, target: float,
         wide = spread_pct > WIDE_MARKET_THRESHOLD
 
         kind = "CALL" if is_call else "PUT"
-        note = (f"Buy {strike:g}{kind[0]} @ ~${px:.2f}. Max loss ${px*100:.0f}/contract (the whole "
-                f"premium). If {ticker} reaches ${target:.2f} by expiry this is worth roughly "
-                f"${intrinsic_at_target*100:.0f}/contract ({upside_pct:+d}%).")
+        oi, strike_vol, thin = _leg_liquidity(row)
+
+        # ---- quality gates: score the trade down for each way it can quietly lose ----
+        warnings: list[str] = []
+        score = 100
+
+        ivx = iv_assessment(ticker, iv)
+        if ivx["verdict"] == "very_rich":
+            score -= 30
+            warnings.append(f"Very expensive premium ({ivx['ratio']}x realized vol)")
+        elif ivx["verdict"] == "rich":
+            score -= 15
+            warnings.append(f"Expensive premium ({ivx['ratio']}x realized vol)")
+        elif ivx["verdict"] == "cheap":
+            score += 5
+
+        earn = earnings_check(ticker, expiry)
+        if earn["in_hold"]:
+            score -= 35
+            warnings.append(f"Earnings {earn['date']} inside the hold - IV crush risk")
+        elif earn["before_expiry"]:
+            score -= 5
+            warnings.append(f"Earnings {earn['date']} before expiry - be out first")
+
+        if oi < MIN_OI_SOFT:
+            score -= 30
+            warnings.append(f"Almost no open interest ({oi}) - you may not get filled fairly")
+        elif oi < MIN_OPEN_INTEREST:
+            score -= 12
+            warnings.append(f"Thin open interest ({oi})")
+
         if wide:
-            note += (f" WIDE MARKET ({spread_pct*100:.0f}% bid/ask) - use a limit order.")
+            score -= 12
+            warnings.append(f"Wide bid/ask ({spread_pct*100:.0f}%) - use a limit order")
+
+        reg = regime_alignment(signal)
+        if reg.get("against_trend"):
+            score -= 15
+            warnings.append(f"Against the market trend ({reg.get('regime')})")
+
+        score = max(0, min(100, score))
+
+        note = (f"Buy {strike:g}{kind[0]} @ ~${px:.2f} (delta {delta:.2f}). Max loss "
+                f"${px*100:.0f}/contract (the whole premium). If {ticker} reaches "
+                f"${target:.2f} by expiry this is worth roughly "
+                f"${intrinsic_at_target*100:.0f}/contract ({upside_pct:+d}%).")
+        if warnings:
+            note += " ⚠ " + "; ".join(warnings) + "."
 
         stock_cost = contracts * 100 * entry
         lev = round(stock_cost / cost, 1) if cost > 0 else 0
@@ -270,6 +390,14 @@ def build_long_option(ticker: str, signal: str, entry: float, target: float,
             note=note,
             quoted_at=datetime.now().isoformat(timespec="seconds"),
             max_spread_pct=spread_pct, wide_market=wide,
+            open_interest=oi, strike_volume=strike_vol, illiquid=thin,
+            delta=round(delta, 3),
+            iv_verdict=ivx["verdict"], iv_ratio=ivx["ratio"],
+            iv_expensive=bool(ivx["expensive"]),
+            earnings_date=earn["date"], earnings_in_hold=bool(earn["in_hold"]),
+            regime_aligned=bool(reg.get("aligned", True)),
+            against_trend=bool(reg.get("against_trend", False)),
+            warnings=warnings, quality_score=score,
         )
     except Exception:
         return None
@@ -409,4 +537,17 @@ def play_to_dict(p: OptionsPlay | None) -> dict | None:
         "quoted_at": p.quoted_at,
         "max_spread_pct": p.max_spread_pct,
         "wide_market": p.wide_market,
+        "open_interest": p.open_interest,
+        "strike_volume": p.strike_volume,
+        "illiquid": p.illiquid,
+        "delta": p.delta,
+        "iv_verdict": p.iv_verdict,
+        "iv_ratio": p.iv_ratio,
+        "iv_expensive": p.iv_expensive,
+        "earnings_date": p.earnings_date,
+        "earnings_in_hold": p.earnings_in_hold,
+        "regime_aligned": p.regime_aligned,
+        "against_trend": p.against_trend,
+        "warnings": p.warnings or [],
+        "quality_score": p.quality_score,
     }

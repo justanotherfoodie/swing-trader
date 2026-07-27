@@ -176,8 +176,15 @@ def edit_pos(pos_id: str, req: UpdateRequest):
 
 @app.get("/api/performance")
 def performance():
-    """Realized track record across closed positions."""
+    """Realized track record + per-strategy attribution."""
     return portfolio.performance_stats()
+
+
+@app.get("/api/regime")
+def regime():
+    """Index trend - are we trading with or against the broad market?"""
+    from signals.context import market_regime
+    return market_regime()
 
 
 # ---------- Short-term momentum (1-3 day holds) ----------

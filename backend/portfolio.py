@@ -67,6 +67,17 @@ TRAIL_GIVEBACK_PCT = 8    # ...and sell if it gives back this many points from p
 # fastest way to lose a small account: one gap-down on your only position is the account.
 MAX_POSITION_PCT = 0.40
 
+# Trade-quality floor. Plays scoring below this are excluded outright: they are the
+# expensive-premium / earnings-landmine / no-liquidity setups that lose money slowly
+# even when the direction is right. Between the floor and "good" they are allowed but
+# ranked behind clean setups.
+MIN_QUALITY = 50
+GOOD_QUALITY = 75
+
+# Two calls in the same sector is one bet wearing two hats - XOM and CVX do not diversify
+# each other. One position per sector keeps the portfolio genuinely spread.
+MAX_PER_SECTOR = 1
+
 
 # ---------- persistence ----------
 
@@ -148,8 +159,21 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
             "stop": s["stop_loss"],
             "quality": s["quality"],
             "confidence": s["confidence"],
+            # Which of the 5 strategies actually fired - the key the journal groups by.
+            "strategies": [b["name"] for b in s.get("strategy_breakdown", [])
+                           if b.get("score")],
+            "triggers": s.get("triggers", []),
             "wide_market": op.get("wide_market", False),
             "max_spread_pct": op.get("max_spread_pct", 0),
+            "quality_score": op.get("quality_score", 100),
+            "warnings": op.get("warnings", []),
+            "delta": op.get("delta", 0),
+            "open_interest": op.get("open_interest", 0),
+            "iv_verdict": op.get("iv_verdict", ""),
+            "iv_ratio": op.get("iv_ratio"),
+            "earnings_date": op.get("earnings_date"),
+            "earnings_in_hold": op.get("earnings_in_hold", False),
+            "against_trend": op.get("against_trend", False),
             "contracts": 0,
         }
 
@@ -158,11 +182,14 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
     buy_drafts = [d for d in (make_draft(s) for s in buys[:candidate_pool]) if d]
     sell_drafts = [d for d in (make_draft(s) for s in sells[:candidate_pool]) if d]
 
-    # Prefer liquid (tight bid/ask) picks - a wide-market quote won't hold at fill time,
-    # so push those to the back instead of excluding them outright (still tradeable,
-    # just riskier to price precisely).
-    buy_drafts.sort(key=lambda d: d["wide_market"])
-    sell_drafts.sort(key=lambda d: d["wide_market"])
+    # Drop the trades that lose money quietly regardless of direction: expensive premium,
+    # earnings landmines, no liquidity. Then rank what's left by quality first - a clean
+    # 75-quality setup beats a flashy signal wrapped in a bad contract.
+    rejected = [d for d in buy_drafts + sell_drafts if d["quality_score"] < MIN_QUALITY]
+    buy_drafts = [d for d in buy_drafts if d["quality_score"] >= MIN_QUALITY]
+    sell_drafts = [d for d in sell_drafts if d["quality_score"] >= MIN_QUALITY]
+    buy_drafts.sort(key=lambda d: (-d["quality_score"], d["wide_market"]))
+    sell_drafts.sort(key=lambda d: (-d["quality_score"], d["wide_market"]))
 
     # Seed phase: alternate sides, each time taking the best UNUSED, AFFORDABLE pick.
     # Scanning deeper finds a cheap-enough put even when the top picks are pricey
@@ -170,17 +197,27 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
     chosen = []
     cash = 0.0
     taken = set()
+    sector_count: dict[str, int] = {}
 
     def try_seed(pool):
         nonlocal cash
+        from signals.context import get_sector
         for d in pool:
-            if (d["contracts"] == 0 and d["ticker"] not in taken
-                    and cash + d["per_contract"] <= budget):
-                d["contracts"] = 1
-                cash += d["per_contract"]
-                taken.add(d["ticker"])
-                chosen.append(d)
-                return True
+            if d["contracts"] != 0 or d["ticker"] in taken:
+                continue
+            if cash + d["per_contract"] > budget:
+                continue
+            sec = get_sector(d["ticker"])
+            d["sector"] = sec
+            # One position per sector: two energy calls is a single bet on oil.
+            if sec != "Unknown" and sector_count.get(sec, 0) >= MAX_PER_SECTOR:
+                continue
+            d["contracts"] = 1
+            cash += d["per_contract"]
+            taken.add(d["ticker"])
+            sector_count[sec] = sector_count.get(sec, 0) + 1
+            chosen.append(d)
+            return True
         return False
 
     for _ in range(picks_per_side):
@@ -219,6 +256,7 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
         note += (f" Note: {', '.join(wide_tickers)} has a wide bid/ask spread - "
                  "use a limit order, your fill may differ from the quote below.")
 
+    from signals.context import market_regime
     return {
         "budget": budget,
         "items": items,
@@ -228,6 +266,11 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
         "n_put_contracts": n_puts,
         "note": note,
         "priced_at": datetime.now(timezone.utc).isoformat(),
+        "regime": market_regime(),
+        # Surfaced so a quiet plan is explained rather than mysterious: these are the
+        # signals that were filtered out for reasons unrelated to direction.
+        "rejected": [{"ticker": d["ticker"], "quality_score": d["quality_score"],
+                      "warnings": d["warnings"]} for d in rejected][:8],
     }
 
 
@@ -256,6 +299,23 @@ def open_positions(items: list[dict]) -> list[dict]:
                 "status": "open",
                 "peak_pnl_pct": 0.0,   # tracks the best gain seen so far, for profit-lock
                 "scaled_out": [],      # which profit-ladder rungs have been taken
+                # ---- journal: the conditions at entry, so outcomes can be attributed ----
+                # Without this the app can never learn which strategy actually pays. Every
+                # closed trade with these fields is one data point toward killing the
+                # losing setups and sizing up the winners.
+                "entry_context": {
+                    "strategies": it.get("strategies", []),
+                    "quality_score": it.get("quality_score"),
+                    "iv_verdict": it.get("iv_verdict"),
+                    "iv_ratio": it.get("iv_ratio"),
+                    "delta": it.get("delta"),
+                    "open_interest": it.get("open_interest"),
+                    "confidence": it.get("confidence"),
+                    "signal_quality": it.get("quality"),
+                    "sector": it.get("sector"),
+                    "regime": it.get("regime"),
+                    "warnings": it.get("warnings", []),
+                },
             })
         _save(positions)
     return positions
@@ -356,7 +416,39 @@ def performance_stats() -> dict:
         "win_rate": round(len(wins) / len(with_pnl) * 100) if with_pnl else None,
         "avg_win": round(sum(p["realized_pnl"] for p in wins) / len(wins), 2) if wins else 0,
         "avg_loss": round(sum(p["realized_pnl"] for p in losses) / len(losses), 2) if losses else 0,
+        "by_strategy": _attribution(with_pnl, "strategies"),
+        "by_iv": _attribution(with_pnl, "iv_verdict"),
     }
+
+
+def _attribution(trades: list[dict], field: str) -> list[dict]:
+    """Group realized outcomes by an entry-context field.
+
+    This is the feedback loop: with enough closed trades it answers "does the BB squeeze
+    strategy actually make money, or is MACD carrying everything?" and "do the trades I
+    entered at rich IV underperform?" - questions no amount of backtesting settles as
+    honestly as your own fills.
+    """
+    buckets: dict[str, list[float]] = {}
+    for t in trades:
+        ctx = t.get("entry_context") or {}
+        val = ctx.get(field)
+        keys = val if isinstance(val, list) else ([val] if val else [])
+        for k in keys:
+            buckets.setdefault(str(k), []).append(t["realized_pnl"])
+
+    out = []
+    for k, pnls in buckets.items():
+        w = [p for p in pnls if p > 0]
+        out.append({
+            "key": k,
+            "trades": len(pnls),
+            "total_pnl": round(sum(pnls), 2),
+            "avg_pnl": round(sum(pnls) / len(pnls), 2),
+            "win_rate": round(len(w) / len(pnls) * 100),
+        })
+    out.sort(key=lambda d: -d["total_pnl"])
+    return out
 
 
 # ---------- valuation + exit brain ----------

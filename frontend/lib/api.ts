@@ -116,6 +116,39 @@ export interface PlanItem {
   max_loss_total: number;
   wide_market?: boolean;
   max_spread_pct?: number;
+  quality_score?: number;
+  warnings?: string[];
+  delta?: number;
+  open_interest?: number;
+  iv_verdict?: string;
+  iv_ratio?: number | null;
+  earnings_date?: string | null;
+  earnings_in_hold?: boolean;
+  against_trend?: boolean;
+  sector?: string;
+}
+
+export interface Regime {
+  regime: string;
+  bias: number;
+  note: string;
+  spy: number | null;
+  ema50: number | null;
+  ema200: number | null;
+}
+
+export interface RejectedPick {
+  ticker: string;
+  quality_score: number;
+  warnings: string[];
+}
+
+export interface Attribution {
+  key: string;
+  trades: number;
+  total_pnl: number;
+  avg_pnl: number;
+  win_rate: number;
 }
 
 export interface Plan {
@@ -127,6 +160,8 @@ export interface Plan {
   n_put_contracts: number;
   note: string;
   priced_at?: string;
+  regime?: Regime;
+  rejected?: RejectedPick[];
 }
 
 export interface OpenPosition {
@@ -171,6 +206,8 @@ export interface Performance {
   win_rate: number | null;
   avg_win: number;
   avg_loss: number;
+  by_strategy?: Attribution[];
+  by_iv?: Attribution[];
 }
 
 export interface MomentumSignal {
