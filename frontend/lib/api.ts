@@ -97,7 +97,8 @@ export interface PlanItem {
   strategy: string;
   expiry: string;
   long_strike: number;
-  short_strike: number;
+  short_strike: number | null;
+  structure?: "single" | "spread";
   net_debit: number;
   per_contract: number;
   max_profit: number;
@@ -151,9 +152,50 @@ export interface OpenPosition {
   pnl_pct: number;
   peak_pnl_pct?: number;
   pct_of_max: number;
-  action: "HOLD" | "SELL";
+  action: "HOLD" | "SELL" | "SCALE";
   urgency: "now" | "watch";
   reason: string;
+  sell_contracts?: number;
+  structure?: "single" | "spread";
+  scaled_out?: string[];
+}
+
+export interface Performance {
+  closed_total: number;
+  tracked_pnl_count: number;
+  untracked_count: number;
+  open_count: number;
+  realized_pnl: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  avg_win: number;
+  avg_loss: number;
+}
+
+export interface MomentumSignal {
+  ticker: string;
+  signal: "BUY" | "SELL" | "WATCH";
+  score: number;
+  confidence: number;
+  entry: number;
+  stop_loss: number;
+  target: number;
+  risk_reward: number;
+  close_range_pct: number;
+  rel_volume: number;
+  vwap_dist_pct: number;
+  gap_pct: number;
+  atr_pct: number;
+  hold: string;
+  reasons: string[];
+}
+
+export interface MomentumResult {
+  signals: MomentumSignal[];
+  scanned_at: string | null;
+  running: boolean;
+  note: string;
 }
 
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
@@ -176,10 +218,20 @@ export const api = {
   triggerScan: () =>
     fetch(`${API_BASE}/api/scan`, { method: "POST" }).then((r) => r.json()),
   getStatus: () => apiFetch<StatusResult>("/api/status"),
-  buildPlan: (budget: number) => apiPost<Plan>("/api/plan", { budget }),
+  buildPlan: (budget: number, structure: "single" | "spread" = "single") =>
+    apiPost<Plan>("/api/plan", { budget, structure }),
   savePositions: (items: PlanItem[]) =>
     apiPost<{ status: string; count: number }>("/api/positions", { items }),
   getPositions: () => apiFetch<{ positions: OpenPosition[] }>("/api/positions"),
-  closePosition: (id: string) =>
-    apiPost<{ status: string }>(`/api/positions/${id}/close`, {}),
+  closePosition: (id: string, exit_value?: number) =>
+    apiPost<{ status: string }>(`/api/positions/${id}/close`, { exit_value: exit_value ?? null }),
+  scalePosition: (id: string, contracts: number, exit_value?: number) =>
+    apiPost<{ status: string }>(`/api/positions/${id}/scale`, {
+      contracts,
+      exit_value: exit_value ?? null,
+    }),
+  getPerformance: () => apiFetch<Performance>("/api/performance"),
+  getMomentum: (limit = 20) => apiFetch<MomentumResult>(`/api/momentum?limit=${limit}`),
+  scanMomentum: () =>
+    fetch(`${API_BASE}/api/momentum/scan`, { method: "POST" }).then((r) => r.json()),
 };

@@ -187,6 +187,94 @@ def _nearest(df, strike_target):
     return df.loc[idx]
 
 
+def build_long_option(ticker: str, signal: str, entry: float, target: float,
+                      stop: float, risk_budget: float = 200.0,
+                      moneyness: float = 1.0) -> "OptionsPlay | None":
+    """Single-leg long CALL (bullish) or PUT (bearish) - one contract, one click.
+
+    Why offer this alongside spreads: a spread caps your upside at the short strike and
+    requires a multi-leg order most retail apps bury behind an extra UI. A single long
+    option is two taps, and when the underlying actually runs it pays several times what
+    the capped spread would. The tradeoff is real and must be respected: you can lose
+    100% of the premium, and theta bleeds every day you're wrong. That is precisely why
+    the exit ladder in portfolio.py scales out early on these rather than holding for a
+    home run.
+
+    `moneyness` picks the strike relative to spot: 1.0 = at-the-money, 1.03 = ~3% OTM
+    (cheaper, more leverage, lower probability).
+    """
+    if signal not in ("BUY", "SELL"):
+        return None
+    try:
+        t = yf.Ticker(ticker)
+        exps = t.options
+        if not exps:
+            return None
+        expiry, dte = _pick_expiry(exps)
+        if not expiry:
+            return None
+        chain = t.option_chain(expiry)
+    except Exception:
+        return None
+
+    try:
+        is_call = signal == "BUY"
+        df = (chain.calls if is_call else chain.puts).sort_values("strike").reset_index(drop=True)
+        if df.empty:
+            return None
+
+        want = entry * moneyness if is_call else entry * (2 - moneyness)
+        row = _nearest(df, want)
+        strike = float(row["strike"])
+        px = _leg_price(row, "buy")
+        if px <= 0:
+            return None
+
+        iv = float(row.get("impliedVolatility") or 0)
+        breakeven = round(strike + px, 2) if is_call else round(strike - px, 2)
+        pop_raw = _prob_above(entry, breakeven, iv, dte)
+        pop = int(round((pop_raw if is_call else 1 - pop_raw) * 100))
+
+        # Value if the underlying reaches the engine's price target by expiry (intrinsic
+        # floor - real value would be higher with time premium left, so this is conservative).
+        intrinsic_at_target = max(0.0, (target - strike) if is_call else (strike - target))
+        upside_pct = round((intrinsic_at_target - px) / px * 100) if px > 0 else 0
+
+        contracts = max(1, int(risk_budget / (px * 100)))
+        cost = round(contracts * px * 100, 2)
+        spread_pct = round(_leg_spread_pct(row), 3)
+        wide = spread_pct > WIDE_MARKET_THRESHOLD
+
+        kind = "CALL" if is_call else "PUT"
+        note = (f"Buy {strike:g}{kind[0]} @ ~${px:.2f}. Max loss ${px*100:.0f}/contract (the whole "
+                f"premium). If {ticker} reaches ${target:.2f} by expiry this is worth roughly "
+                f"${intrinsic_at_target*100:.0f}/contract ({upside_pct:+d}%).")
+        if wide:
+            note += (f" WIDE MARKET ({spread_pct*100:.0f}% bid/ask) - use a limit order.")
+
+        stock_cost = contracts * 100 * entry
+        lev = round(stock_cost / cost, 1) if cost > 0 else 0
+
+        return OptionsPlay(
+            strategy=f"Long {kind}",
+            expiry=expiry, dte=dte,
+            legs=[OptionLeg("BUY", kind, strike, round(px, 2))],
+            net_debit=round(px, 2),
+            max_profit=round(intrinsic_at_target - px, 2),  # at the engine's target
+            max_loss=round(px, 2),
+            breakeven=breakeven,
+            risk_reward=round((intrinsic_at_target - px) / px, 2) if px > 0 else 0,
+            prob_profit=pop,
+            contracts=contracts, cost=cost,
+            capital_vs_stock=f"{lev}x leverage vs ${stock_cost:,.0f} in shares",
+            note=note,
+            quoted_at=datetime.now().isoformat(timespec="seconds"),
+            max_spread_pct=spread_pct, wide_market=wide,
+        )
+    except Exception:
+        return None
+
+
 def _bull_call_spread(calls, entry, target, dte, expiry, spot, risk_budget):
     calls = calls.sort_values("strike").reset_index(drop=True)
     if len(calls) < 2:

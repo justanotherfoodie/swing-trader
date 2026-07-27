@@ -141,10 +141,97 @@ def list_positions():
     return {"positions": portfolio.evaluate()}
 
 
+class CloseRequest(BaseModel):
+    exit_value: float | None = None
+
+
+class ScaleRequest(BaseModel):
+    contracts: int
+    exit_value: float | None = None
+
+
+class UpdateRequest(BaseModel):
+    fields: dict
+
+
 @app.post("/api/positions/{pos_id}/close")
-def close_pos(pos_id: str):
-    portfolio.close_position(pos_id)
+def close_pos(pos_id: str, req: CloseRequest | None = None):
+    portfolio.close_position(pos_id, req.exit_value if req else None)
     return {"status": "closed", "id": pos_id}
+
+
+@app.post("/api/positions/{pos_id}/scale")
+def scale_pos(pos_id: str, req: ScaleRequest):
+    """Sell part of a position (profit-ladder tier) and keep the rest open."""
+    portfolio.scale_out(pos_id, req.contracts, req.exit_value)
+    return {"status": "scaled", "id": pos_id, "contracts_sold": req.contracts}
+
+
+@app.patch("/api/positions/{pos_id}")
+def edit_pos(pos_id: str, req: UpdateRequest):
+    """Correct a position to match what actually filled in your broker."""
+    portfolio.update_position(pos_id, req.fields)
+    return {"status": "updated", "id": pos_id}
+
+
+@app.get("/api/performance")
+def performance():
+    """Realized track record across closed positions."""
+    return portfolio.performance_stats()
+
+
+# ---------- Short-term momentum (1-3 day holds) ----------
+
+_momentum_cache: dict = {"signals": [], "scanned_at": None, "running": False}
+
+
+def _momentum_scan(limit: int = 120):
+    import concurrent.futures, time as _t
+    from signals.intraday import score_momentum, signal_to_dict
+    from data.universe import get_universe
+
+    _momentum_cache["running"] = True
+    try:
+        # Rank by the daily scan's conviction first so the intraday pass spends its
+        # (much slower, one-download-per-ticker) budget on names already worth watching.
+        daily = get_last_scan().get("signals", [])
+        preferred = [s["ticker"] for s in daily]
+        universe = preferred + [t for t in get_universe() if t not in set(preferred)]
+        tickers = universe[:limit]
+
+        out = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            for m in ex.map(lambda t: score_momentum(t), tickers):
+                if m and m.signal != "WATCH":
+                    out.append(signal_to_dict(m))
+        out.sort(key=lambda d: -abs(d["score"]))
+        _momentum_cache["signals"] = out
+        _momentum_cache["scanned_at"] = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+    except Exception as e:
+        print(f"[momentum] scan error: {e}")
+    finally:
+        _momentum_cache["running"] = False
+
+
+@app.get("/api/momentum")
+def momentum(limit: int = 20):
+    return {
+        "signals": _momentum_cache["signals"][:limit],
+        "scanned_at": _momentum_cache["scanned_at"],
+        "running": _momentum_cache["running"],
+        "note": ("Short-term momentum from the last completed session, for 1-3 day holds. "
+                 "Not intraday scalping: the free data feed is ~15 min delayed, and a US "
+                 "account under $25k is capped at 3 day trades per rolling 5 business days "
+                 "(PDT rule)."),
+    }
+
+
+@app.post("/api/momentum/scan")
+def trigger_momentum(background_tasks: BackgroundTasks):
+    if _momentum_cache["running"]:
+        return {"status": "already_running"}
+    background_tasks.add_task(_momentum_scan)
+    return {"status": "started"}
 
 
 @app.get("/health")

@@ -5,6 +5,7 @@ import { MacroBar } from "@/components/MacroBar";
 import { SignalCard } from "@/components/SignalCard";
 import { TickerSearch } from "@/components/TickerSearch";
 import { OptionsPlanner } from "@/components/OptionsPlanner";
+import { MomentumPanel } from "@/components/MomentumPanel";
 
 type Filter = "ALL" | "BUY" | "SELL" | "WATCH";
 
@@ -74,6 +75,9 @@ export default function Dashboard() {
 
       {/* Guided options workflow: budget -> what to buy -> when to sell */}
       <OptionsPlanner />
+
+      {/* Short-term momentum: 1-3 day holds from the intraday tape */}
+      <MomentumPanel />
 
       {/* Ticker search */}
       <TickerSearch />

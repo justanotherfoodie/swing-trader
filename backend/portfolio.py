@@ -39,18 +39,33 @@ import yfinance as yf
 
 from data.fetcher import get_ohlcv, get_current_price
 from signals.scorer import score_ticker
-from signals.options import black_scholes, build_options_play, play_to_dict
+from signals.options import (black_scholes, build_options_play, build_long_option,
+                             play_to_dict)
 
 _PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
 _lock = threading.Lock()
 
 TAKE_PROFIT_PCT = 0.70    # captured this share of max profit -> take it
-STOP_LOSS_PCT = 0.50      # lost this share of premium -> cut it
+STOP_LOSS_PCT = 0.40      # lost this share of premium -> cut it (was 0.50; long options
+                          # decay faster than spreads, so cut sooner)
 TIME_STOP_DTE = 14
 MAX_HOLD_DAYS = 12
-BIG_WIN_PCT = 75           # premium gain this large -> take it outright
-PROFIT_LOCK_TRIGGER_PCT = 30   # peak gain needed before we start protecting it
-PROFIT_LOCK_GIVEBACK_PCT = 12  # percentage-point pullback from peak that triggers sell
+
+# ---- Profit ladder ----------------------------------------------------------
+# Scale OUT in tiers instead of holding for a home run. A long option that is up 30%
+# can be flat two sessions later; taking a chunk off converts paper gains into money
+# while leaving a runner for the move to continue. These are the numbers that answer
+# "why not take profit at 20 or 30%".
+TIER1_PCT = 25            # first scale-out: sell ~half
+TIER2_PCT = 50            # second scale-out: sell ~half of what's left
+TIER3_PCT = 80            # close the runner entirely
+SINGLE_CT_TAKE_PCT = 30   # can't split 1 contract - just take the whole thing here
+TRAIL_ARM_PCT = 20        # once peaked at least this high, protect it
+TRAIL_GIVEBACK_PCT = 8    # ...and sell if it gives back this many points from peak
+
+# No single ticker may absorb more than this share of the budget. Concentration is the
+# fastest way to lose a small account: one gap-down on your only position is the account.
+MAX_POSITION_PCT = 0.40
 
 
 # ---------- persistence ----------
@@ -73,7 +88,7 @@ def _save(positions: list[dict]):
 # ---------- plan building ----------
 
 def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
-               candidate_pool: int = 6) -> dict:
+               candidate_pool: int = 6, structure: str = "single") -> dict:
     """Allocate budget across the best spreads, re-priced LIVE at request time.
 
     The signal list (direction, quality, confidence) comes from the last market scan -
@@ -97,23 +112,31 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
                 "priced_at": datetime.now(timezone.utc).isoformat()}
 
     def make_draft(s):
-        """Re-quote this signal's spread live (fresh bid/ask), not the scan-time cache."""
-        fresh = build_options_play(s["ticker"], s["signal"], s["entry"],
-                                   s["take_profit_1"], s["stop_loss"])
+        """Re-quote this signal live (fresh bid/ask), not the scan-time cache.
+
+        `structure` picks what to actually buy: "single" = one long call/put (two taps
+        in any broker, uncapped upside, whole premium at risk) or "spread" = a vertical
+        debit spread (cheaper, capped both ways, multi-leg order).
+        """
+        builder = build_long_option if structure == "single" else build_options_play
+        fresh = builder(s["ticker"], s["signal"], s["entry"],
+                        s["take_profit_1"], s["stop_loss"])
         op = play_to_dict(fresh)
         if op is None:
             return None
         per_contract = op["net_debit"] * 100
         if per_contract <= 0:
             return None
+        legs = op["legs"]
         return {
             "ticker": s["ticker"],
             "signal": s["signal"],
             "kind": "call" if s["signal"] == "BUY" else "put",
             "strategy": op["strategy"],
             "expiry": op["expiry"],
-            "long_strike": op["legs"][0]["strike"],
-            "short_strike": op["legs"][1]["strike"],
+            "long_strike": legs[0]["strike"],
+            "short_strike": legs[1]["strike"] if len(legs) > 1 else None,
+            "structure": "single" if len(legs) == 1 else "spread",
             "net_debit": op["net_debit"],
             "per_contract": round(per_contract, 2),
             "max_profit": op["max_profit"],
@@ -164,12 +187,16 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
         try_seed(buy_drafts)
         try_seed(sell_drafts)
 
-    # Round-robin top-up: spend the rest evenly across chosen positions.
+    # Round-robin top-up, but capped per position. Without a cap the cheapest contract
+    # absorbs the entire budget - six contracts of one ticker is a single undiversified
+    # bet, not a portfolio, and one bad earnings print takes the whole account with it.
+    max_per_position = budget * MAX_POSITION_PCT
     improved = True
     while improved:
         improved = False
         for d in chosen:
-            if cash + d["per_contract"] <= budget:
+            spent_here = d["per_contract"] * (d["contracts"] + 1)
+            if cash + d["per_contract"] <= budget and spent_here <= max_per_position:
                 d["contracts"] += 1
                 cash += d["per_contract"]
                 improved = True
@@ -183,8 +210,11 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
     n_calls = sum(d["contracts"] for d in items if d["kind"] == "call")
     n_puts = sum(d["contracts"] for d in items if d["kind"] == "put")
     wide_tickers = [d["ticker"] for d in items if d.get("wide_market")]
-    note = (f"Buy {n_calls} call-spread + {n_puts} put-spread contracts. "
-            f"Defined risk: most you can lose is ${cash:,.0f}.")
+    label = "call" if structure == "single" else "call-spread"
+    plabel = "put" if structure == "single" else "put-spread"
+    note = (f"Buy {n_calls} {label} + {n_puts} {plabel} contracts across "
+            f"{len(items)} position{'s' if len(items) != 1 else ''}. "
+            f"Most you can lose is ${cash:,.0f} (the full premium).")
     if wide_tickers:
         note += (f" Note: {', '.join(wide_tickers)} has a wide bid/ask spread - "
                  "use a limit order, your fill may differ from the quote below.")
@@ -216,7 +246,7 @@ def open_positions(items: list[dict]) -> list[dict]:
                 "strategy": it.get("strategy", ""),
                 "expiry": it["expiry"],
                 "long_strike": it["long_strike"],
-                "short_strike": it["short_strike"],
+                "short_strike": it.get("short_strike"),
                 "net_debit": it["net_debit"],
                 "contracts": it["contracts"],
                 "entry_spot": it["entry_spot"],
@@ -225,20 +255,108 @@ def open_positions(items: list[dict]) -> list[dict]:
                 "opened_at": now,
                 "status": "open",
                 "peak_pnl_pct": 0.0,   # tracks the best gain seen so far, for profit-lock
+                "scaled_out": [],      # which profit-ladder rungs have been taken
             })
         _save(positions)
     return positions
 
 
-def close_position(pos_id: str):
+def close_position(pos_id: str, exit_value: float | None = None):
+    """Close a position fully. `exit_value` is total $ received, for realized-P&L stats."""
     positions = _load()
     with _lock:
         for p in positions:
             if p["id"] == pos_id:
                 p["status"] = "closed"
                 p["closed_at"] = datetime.now(timezone.utc).isoformat()
+                if exit_value is not None:
+                    p["exit_value"] = round(float(exit_value), 2)
+                    cost = p["net_debit"] * 100 * p["contracts"]
+                    p["realized_pnl"] = round(float(exit_value) - cost, 2)
         _save(positions)
     return _load()
+
+
+def scale_out(pos_id: str, contracts_sold: int, exit_value: float | None = None):
+    """Sell PART of a position and keep the rest open.
+
+    This is what makes the profit ladder real: banking half at +25% is only possible if
+    the tracker can hold a partially-closed position. Records the realized piece and
+    marks which ladder rung was taken so the same tier doesn't fire again.
+    """
+    positions = _load()
+    with _lock:
+        for p in positions:
+            if p["id"] != pos_id:
+                continue
+            sold = max(1, min(int(contracts_sold), p["contracts"]))
+            realized = None
+            if exit_value is not None:
+                cost_of_sold = p["net_debit"] * 100 * sold
+                realized = round(float(exit_value) - cost_of_sold, 2)
+                p["realized_pnl"] = round(p.get("realized_pnl", 0.0) + realized, 2)
+            p["contracts"] -= sold
+            rungs = set(p.get("scaled_out", []))
+            rungs.add("t1" if "t1" not in rungs else "t2")
+            p["scaled_out"] = sorted(rungs)
+            p.setdefault("partial_exits", []).append({
+                "contracts": sold,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "exit_value": exit_value,
+                "realized_pnl": realized,
+            })
+            if p["contracts"] <= 0:
+                p["status"] = "closed"
+                p["closed_at"] = datetime.now(timezone.utc).isoformat()
+        _save(positions)
+    return _load()
+
+
+def update_position(pos_id: str, fields: dict):
+    """Correct a position's details to match what actually filled in your broker.
+
+    Needed because the plan is a recommendation, not an execution: if you buy a single
+    $85 call when the plan suggested an 80/90 spread, every downstream P&L number and
+    exit verdict is computed against a position you don't own. Set `short_strike` to
+    null here to convert a mis-recorded spread into the single long option you hold.
+    """
+    allowed = {"ticker", "kind", "expiry", "long_strike", "short_strike", "net_debit",
+               "contracts", "entry_spot", "target", "stop", "strategy", "peak_pnl_pct"}
+    positions = _load()
+    with _lock:
+        for p in positions:
+            if p["id"] == pos_id:
+                for k, v in fields.items():
+                    if k in allowed:
+                        p[k] = v
+                if "short_strike" in fields and fields["short_strike"] is None:
+                    p["strategy"] = f"Long {p['kind'].upper()}"
+                p["peak_pnl_pct"] = float(fields.get("peak_pnl_pct", 0.0))
+        _save(positions)
+    return _load()
+
+
+def performance_stats() -> dict:
+    """Realized track record across closed positions - your actual edge, not backtested."""
+    positions = _load()
+    closed = [p for p in positions if p.get("status") == "closed"]
+    with_pnl = [p for p in closed if p.get("realized_pnl") is not None]
+    wins = [p for p in with_pnl if p["realized_pnl"] > 0]
+    losses = [p for p in with_pnl if p["realized_pnl"] <= 0]
+    total = round(sum(p["realized_pnl"] for p in with_pnl), 2)
+    open_ct = len([p for p in positions if p.get("status") == "open"])
+    return {
+        "closed_total": len(closed),
+        "tracked_pnl_count": len(with_pnl),
+        "untracked_count": len(closed) - len(with_pnl),
+        "open_count": open_ct,
+        "realized_pnl": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(len(wins) / len(with_pnl) * 100) if with_pnl else None,
+        "avg_win": round(sum(p["realized_pnl"] for p in wins) / len(wins), 2) if wins else 0,
+        "avg_loss": round(sum(p["realized_pnl"] for p in losses) / len(losses), 2) if losses else 0,
+    }
 
 
 # ---------- valuation + exit brain ----------
@@ -254,7 +372,13 @@ def _realized_iv(ticker: str) -> float:
 
 
 def _spread_mark(ticker, expiry, long_k, short_k, kind, spot, dte) -> float:
-    """Current per-share value of the spread. Live chain mid if available, else BS."""
+    """Current per-share value of the position. Live chain mid if available, else BS.
+
+    Handles BOTH structures:
+      - single long option: short_k is None -> value is just the long leg
+      - vertical spread:    short_k set     -> value is long leg minus short leg
+    """
+    single = short_k is None
     try:
         t = yf.Ticker(ticker)
         chain = t.option_chain(expiry)
@@ -271,15 +395,22 @@ def _spread_mark(ticker, expiry, long_k, short_k, kind, spot, dte) -> float:
                 return (b + a) / 2
             return last if last > 0 else None
 
-        lm, sm = mid(long_k), mid(short_k)
-        if lm is not None and sm is not None:
-            return max(0.0, lm - sm)
+        lm = mid(long_k)
+        if single:
+            if lm is not None:
+                return max(0.0, lm)
+        else:
+            sm = mid(short_k)
+            if lm is not None and sm is not None:
+                return max(0.0, lm - sm)
     except Exception:
         pass
     # Fallback: Black-Scholes
     iv = _realized_iv(ticker)
-    return max(0.0, black_scholes(spot, long_k, dte, iv, kind)
-               - black_scholes(spot, short_k, dte, iv, kind))
+    long_val = black_scholes(spot, long_k, dte, iv, kind)
+    if single:
+        return max(0.0, long_val)
+    return max(0.0, long_val - black_scholes(spot, short_k, dte, iv, kind))
 
 
 def _evaluate_one(p: dict) -> dict:
@@ -290,11 +421,18 @@ def _evaluate_one(p: dict) -> dict:
     opened = datetime.fromisoformat(p["opened_at"]).date()
     days_held = (today - opened).days
 
-    width = abs(p["short_strike"] - p["long_strike"])
+    short_k = p.get("short_strike")          # None => single long option
     entry_debit = p["net_debit"]
-    max_profit = max(0.01, width - entry_debit)
+    if short_k is None:
+        # A long option has no capped max - use the engine's price target as the
+        # reference "full move" so pct_of_max stays meaningful for the UI.
+        tgt_intrinsic = (max(0.0, p["target"] - p["long_strike"]) if p["kind"] == "call"
+                         else max(0.0, p["long_strike"] - p["target"]))
+        max_profit = max(0.01, tgt_intrinsic - entry_debit)
+    else:
+        max_profit = max(0.01, abs(short_k - p["long_strike"]) - entry_debit)
 
-    mark = _spread_mark(p["ticker"], p["expiry"], p["long_strike"], p["short_strike"],
+    mark = _spread_mark(p["ticker"], p["expiry"], p["long_strike"], short_k,
                         p["kind"], spot, dte)
     contracts = p["contracts"]
     cost = round(entry_debit * 100 * contracts, 2)
@@ -327,49 +465,68 @@ def _evaluate_one(p: dict) -> dict:
     except Exception:
         pass
 
-    gave_back = (peak_pnl_pct >= PROFIT_LOCK_TRIGGER_PCT
-                and pnl_pct <= peak_pnl_pct - PROFIT_LOCK_GIVEBACK_PCT)
+    # Which ladder rungs have already been taken on this position.
+    done = set(p.get("scaled_out", []))
+    trailing = (peak_pnl_pct >= TRAIL_ARM_PCT
+                and pnl_pct <= peak_pnl_pct - TRAIL_GIVEBACK_PCT)
+
+    sell_contracts = contracts   # default: exit everything
 
     if broke_stop or pnl_pct <= -STOP_LOSS_PCT * 100:
         action, urgency = "SELL", "now"
         reason = ("Underlying broke your stop level. " if broke_stop else
-                  f"Spread down {pnl_pct:.0f}%. ") + "Cut the loss — sell at next market open."
-    elif pnl_pct >= BIG_WIN_PCT:
+                  f"Down {pnl_pct:.0f}% on premium. ") + "Cut it — sell at next market open."
+    elif trailing:
         action, urgency = "SELL", "now"
-        reason = (f"Up {pnl_pct:.0f}% on premium — take the win. Getting much further "
-                  "requires the stock to run all the way to your short strike, which is "
-                  "the low-probability tail case. Lock it in at next market open.")
-    elif gave_back:
+        reason = (f"Peaked at +{peak_pnl_pct:.0f}%, now +{pnl_pct:.0f}% — it's giving the gain "
+                  "back. Take what's left at next open rather than round-tripping to zero.")
+    elif pnl_pct >= TIER3_PCT:
         action, urgency = "SELL", "now"
-        reason = (f"Peaked at +{peak_pnl_pct:.0f}% and has slipped to +{pnl_pct:.0f}% — "
-                  "lock in the gain before it round-trips to breakeven. Sell at next open.")
+        reason = (f"Up {pnl_pct:.0f}% — close the runner. This is already a great trade; "
+                  "holding for more is where good options trades turn into round trips.")
+    elif contracts == 1 and pnl_pct >= SINGLE_CT_TAKE_PCT and "single" not in done:
+        # One contract can't be split, so the ladder collapses to a single decision.
+        action, urgency = "SELL", "now"
+        reason = (f"Up {pnl_pct:.0f}% on a single contract — you can't scale out of one, "
+                  "so take the whole profit now. A 30% option gain in a few days is a good "
+                  "trade; don't wait for the double.")
+    elif contracts >= 2 and pnl_pct >= TIER2_PCT and "t2" not in done:
+        action, urgency = "SCALE", "now"
+        sell_contracts = max(1, (contracts + 1) // 2)
+        reason = (f"Up {pnl_pct:.0f}% — take tier 2: sell {sell_contracts} of {contracts}. "
+                  "Bank the bulk of the move, keep a runner in case it keeps going.")
+    elif contracts >= 2 and pnl_pct >= TIER1_PCT and "t1" not in done:
+        action, urgency = "SCALE", "now"
+        sell_contracts = contracts // 2
+        reason = (f"Up {pnl_pct:.0f}% — take tier 1: sell {sell_contracts} of {contracts}. "
+                  "This locks in real money and makes the rest of the trade close to free.")
     elif hit_target or pct_of_max >= TAKE_PROFIT_PCT:
         action, urgency = "SELL", "now"
-        reason = (f"Target reached — captured ~{max(0,pct_of_max)*100:.0f}% of max profit. "
-                  "Lock it in: sell at next market open.")
+        reason = (f"Price target reached (~{max(0,pct_of_max)*100:.0f}% of the expected move). "
+                  "Lock it in at next market open.")
     elif dte <= TIME_STOP_DTE:
         action, urgency = "SELL", "now"
-        reason = (f"Only {dte} days to expiry — time decay accelerates from here. "
+        reason = (f"Only {dte} days to expiry — theta accelerates hard from here. "
                   "Close it at next market open regardless of P&L.")
     elif days_held >= MAX_HOLD_DAYS:
         action, urgency = "SELL", "now"
         reason = (f"Held {days_held} days — past the swing window. "
-                  "Take what's there and move on.")
+                  "Take what's there and recycle the capital.")
     elif flipped:
         action, urgency = "SELL", "now"
         reason = "The stock's signal flipped against you — thesis broken. Exit at next open."
     else:
-        progress = pct_of_max * 100
-        if peak_pnl_pct >= 15 and pnl_pct < peak_pnl_pct:
+        next_rung = (SINGLE_CT_TAKE_PCT if contracts == 1 else
+                     (TIER1_PCT if "t1" not in done else TIER2_PCT))
+        if peak_pnl_pct >= TRAIL_ARM_PCT and pnl_pct < peak_pnl_pct:
             reason = (f"Hold, but watch it — peaked at +{peak_pnl_pct:.0f}%, now +{pnl_pct:.0f}%. "
-                      f"Will flag SELL if it slips to +{peak_pnl_pct - PROFIT_LOCK_GIVEBACK_PCT:.0f}%.")
-        elif progress < 5:
-            reason = (f"Hold. Still early ({days_held}d held, {dte}d to expiry) — "
-                      "a small day-1 dip is just the bid/ask spread, not a loss yet. "
-                      "Let the trade work.")
+                      f"Flags SELL if it slips to +{peak_pnl_pct - TRAIL_GIVEBACK_PCT:.0f}%.")
+        elif pnl_pct > 0:
+            reason = (f"Hold — up {pnl_pct:.0f}%, {days_held}d held, {dte}d to expiry. "
+                      f"Next action at +{next_rung:.0f}%.")
         else:
-            reason = (f"On track — hold. ~{progress:.0f}% of the way to max profit, "
-                      f"{days_held}d held, {dte}d to expiry.")
+            reason = (f"Hold. {days_held}d held, {dte}d to expiry, down {abs(pnl_pct):.0f}% — "
+                      f"still inside the {STOP_LOSS_PCT*100:.0f}% stop. Let it work.")
 
     return {
         **{k: p[k] for k in ("id", "ticker", "kind", "strategy", "expiry",
@@ -388,6 +545,9 @@ def _evaluate_one(p: dict) -> dict:
         "action": action,
         "urgency": urgency,
         "reason": reason,
+        "sell_contracts": sell_contracts if action in ("SELL", "SCALE") else 0,
+        "structure": "single" if short_k is None else "spread",
+        "scaled_out": sorted(done),
     }
 
 
