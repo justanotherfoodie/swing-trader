@@ -170,6 +170,10 @@ MIN_OI_SOFT = 25              # below this it is unusable; between the two it is
 TARGET_DELTA = 0.62
 DELTA_MIN, DELTA_MAX = 0.45, 0.80
 
+# Minimum credit as a fraction of strike width when SELLING premium. Guards against
+# spreads that collect pennies while risking the full width.
+MIN_CREDIT_FRAC = 0.12
+
 
 def _bs_delta(spot: float, strike: float, dte: int, iv: float, kind: str) -> float:
     """Black-Scholes delta - how much the option moves per $1 move in the stock."""
@@ -299,6 +303,174 @@ def build_options_play(ticker: str, signal: str, entry: float, target: float,
 def _nearest(df, strike_target):
     idx = (df["strike"] - strike_target).abs().idxmin()
     return df.loc[idx]
+
+
+def build_credit_spread(ticker: str, signal: str, entry: float, target: float,
+                        stop: float, risk_budget: float = 200.0,
+                        short_delta: float = 0.25) -> "OptionsPlay | None":
+    """Defined-risk CREDIT spread - get paid for time passing instead of paying for it.
+
+    Everything else in this module BUYS premium, which needs a real move to pay off. In a
+    sideways, low-volatility tape that is the losing side of the trade: theta grinds the
+    position down every day while the move never arrives. Backtesting the long strategies
+    across a choppy stretch produced a loss in every window.
+
+    A credit spread inverts the bet. You SELL an out-of-the-money option and BUY a further
+    one as insurance, collecting the difference up front. You keep it if the stock simply
+    fails to travel far enough against you - which is exactly what chop does.
+
+      BUY  signal (bullish/neutral) -> Bull Put Spread  (sell put below, buy lower put)
+      SELL signal (bearish/neutral) -> Bear Call Spread (sell call above, buy higher call)
+
+    The trade-off is honest and must be respected: these win often and lose big. Max profit
+    is the credit; max loss is the strike width minus that credit, typically several times
+    larger. The long wing is what makes the loss finite - this is never a naked short.
+
+    `short_delta` sets how far out-of-the-money the sold strike sits. ~0.25 delta means
+    roughly a 75% chance of expiring worthless (your win), which is the conventional
+    premium-selling zone.
+    """
+    if signal not in ("BUY", "SELL"):
+        return None
+    try:
+        t = yf.Ticker(ticker)
+        exps = t.options
+        if not exps:
+            return None
+        expiry, dte = _pick_expiry(exps, min_dte=20, max_dte=45)
+        if not expiry:
+            return None
+        chain = t.option_chain(expiry)
+        # Use the LIVE spot, not the caller's entry price. Strike selection and the
+        # probability math must agree with the same prices the chain is quoting; a stale
+        # or mismatched entry produces nonsense like a credit larger than the max loss.
+        try:
+            entry = float(t.history(period="1d")["Close"].iloc[-1]) or entry
+        except Exception:
+            pass
+    except Exception:
+        return None
+
+    try:
+        is_bullish = signal == "BUY"
+        kind_l = "put" if is_bullish else "call"
+        df = (chain.puts if is_bullish else chain.calls).sort_values("strike").reset_index(drop=True)
+        if len(df) < 3:
+            return None
+
+        # Find the strike closest to the target short delta, on the correct side of spot.
+        cands = []
+        for _, r in df.iterrows():
+            k = float(r["strike"])
+            riv = float(r.get("impliedVolatility") or 0)
+            if riv <= 0 or k <= 0:
+                continue
+            if is_bullish and k >= entry:      # puts must be below spot
+                continue
+            if not is_bullish and k <= entry:  # calls must be above spot
+                continue
+            d = abs(_bs_delta(entry, k, dte, riv, kind_l))
+            cands.append((abs(d - short_delta), k, r, d, riv))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c[0])
+        _, short_k, short_row, sdelta, iv = cands[0]
+
+        # Choose the protective wing by searching, not by assuming. A wider wing collects
+        # slightly more premium but risks far more, so the ratio that matters -
+        # credit relative to width - actually gets WORSE as the wing moves out. Try the
+        # nearest few strikes and keep the best-paying one.
+        inc = strike_increment(entry)
+        best = None
+        for mult in (1, 2, 3):
+            wing = short_k - inc * mult if is_bullish else short_k + inc * mult
+            lrow = _nearest(df, wing)
+            lk = float(lrow["strike"])
+            if (is_bullish and lk >= short_k) or (not is_bullish and lk <= short_k):
+                continue
+            w = abs(short_k - lk)
+            if w <= 0:
+                continue
+            cr = _leg_price(short_row, "sell") - _leg_price(lrow, "buy")
+            if cr <= 0.02 or cr >= w:
+                continue
+            frac = cr / w
+            if best is None or frac > best[0]:
+                best = (frac, cr, w, lk, lrow)
+
+        # The credit must be a meaningful share of what's being risked. Collecting $4
+        # against a $1,096 max loss is a 274:1 bet against you - one loss erases 274 wins.
+        if best is None or best[0] < MIN_CREDIT_FRAC:
+            return None
+        _, credit, width, long_k, long_row = best
+
+        max_loss = width - credit
+        breakeven = (short_k - credit) if is_bullish else (short_k + credit)
+        # Probability the short strike expires worthless (i.e. you keep the credit).
+        p_above = _prob_above(entry, breakeven, iv, dte)
+        pop = int(round((p_above if is_bullish else 1 - p_above) * 100))
+
+        oi_s, vol_s, _ = _leg_liquidity(short_row)
+        oi_l, _, _ = _leg_liquidity(long_row)
+        oi = min(oi_s, oi_l)
+        spread_pct = round(max(_leg_spread_pct(short_row), _leg_spread_pct(long_row)), 3)
+        wide = spread_pct > WIDE_MARKET_THRESHOLD
+
+        # Risk here is max_loss per contract, not the premium.
+        contracts = max(1, int(risk_budget / (max_loss * 100))) if max_loss > 0 else 1
+        collateral = round(max_loss * 100 * contracts, 2)
+
+        qa = assess_quality(ticker, signal, expiry, iv, oi, wide, spread_pct,
+                            is_debit_spread=False)
+        # Rich IV is a REASON to sell, not a penalty - undo the buyer's-side deduction.
+        warnings = [w for w in qa["warnings"] if "expensive premium" not in w.lower()]
+        score = qa["score"]
+        ivx = qa["iv"]
+        if ivx["verdict"] in ("rich", "very_rich"):
+            score = min(100, score + (30 if ivx["verdict"] == "very_rich" else 15) + 5)
+            warnings.append(f"Rich premium ({ivx['ratio']}x realized) - good for SELLING")
+        elif ivx["verdict"] == "cheap":
+            score -= 10
+            warnings.append("Cheap premium - little to collect selling here")
+        score = max(0, min(100, score))
+
+        strategy = "Bull Put Spread" if is_bullish else "Bear Call Spread"
+        kind_u = "PUT" if is_bullish else "CALL"
+        note = (f"Sell {short_k:g}{kind_u[0]} / buy {long_k:g}{kind_u[0]} for a "
+                f"${credit*100:.0f} credit per contract. You keep it if {ticker} stays "
+                f"{'above' if is_bullish else 'below'} ${breakeven:.2f}. Max loss "
+                f"${max_loss*100:.0f}/contract. Wins often, loses big - respect the size.")
+        if warnings:
+            note += " " + "; ".join(warnings) + "."
+
+        return OptionsPlay(
+            strategy=strategy, expiry=expiry, dte=dte,
+            legs=[
+                OptionLeg("SELL", kind_u, short_k, round(_leg_price(short_row, "sell"), 2)),
+                OptionLeg("BUY", kind_u, long_k, round(_leg_price(long_row, "buy"), 2)),
+            ],
+            net_debit=round(-credit, 2),        # negative = you receive money
+            max_profit=round(credit, 2),
+            max_loss=round(max_loss, 2),
+            breakeven=round(breakeven, 2),
+            risk_reward=round(credit / max_loss, 2) if max_loss > 0 else 0,
+            prob_profit=pop, contracts=contracts, cost=collateral,
+            capital_vs_stock=f"${collateral:,.0f} collateral held against max loss",
+            note=note,
+            quoted_at=datetime.now().isoformat(timespec="seconds"),
+            max_spread_pct=spread_pct, wide_market=wide,
+            open_interest=oi, strike_volume=vol_s, illiquid=oi < MIN_OI_SOFT,
+            delta=round(sdelta, 3),
+            iv_verdict=ivx["verdict"], iv_ratio=ivx["ratio"],
+            iv_expensive=bool(ivx["expensive"]),
+            earnings_date=qa["earnings"]["date"],
+            earnings_in_hold=bool(qa["earnings"]["in_hold"]),
+            regime_aligned=bool(qa["regime"].get("aligned", True)),
+            against_trend=bool(qa["regime"].get("against_trend", False)),
+            warnings=warnings, quality_score=score,
+        )
+    except Exception:
+        return None
 
 
 def build_long_option(ticker: str, signal: str, entry: float, target: float,
@@ -571,10 +743,42 @@ def _bear_put_spread(puts, entry, target, dte, expiry, spot, risk_budget, ticker
     )
 
 
+def limit_price_guidance(net_price: float, spread_pct: float, is_credit: bool = False) -> dict:
+    """Turn "use a limit order" into an actual number to type into the broker.
+
+    Saying "use a limit" without a price is useless advice. On a wide market the
+    difference between paying the ask and working an order near mid is several percent
+    of the trade - which, per the walk-forward, is roughly the size of the entire edge.
+    """
+    px = abs(net_price)
+    half = px * spread_pct / 2 if spread_pct else px * 0.02
+    if is_credit:
+        # Selling: start greedy (above mid), settle no lower than a bit under mid.
+        start = round(px + half * 0.4, 2)
+        walk = round(px, 2)
+        floor = round(px - half * 0.6, 2)
+        return {"start": start, "fair": walk, "worst_acceptable": floor,
+                "instruction": (f"Place a LIMIT SELL to open at ${start:.2f} credit. "
+                                f"If unfilled in a few minutes, work down toward ${walk:.2f}. "
+                                f"Do not accept less than ${floor:.2f} - below that the "
+                                "premium stops paying for the risk.")}
+    start = round(px - half * 0.4, 2)
+    walk = round(px, 2)
+    cap = round(px + half * 0.6, 2)
+    return {"start": start, "fair": walk, "worst_acceptable": cap,
+            "instruction": (f"Place a LIMIT BUY at ${start:.2f}. If unfilled in a few "
+                            f"minutes, raise toward ${walk:.2f}. Never chase past "
+                            f"${cap:.2f} - paying up erases the edge on a trade this size.")}
+
+
 def play_to_dict(p: OptionsPlay | None) -> dict | None:
     if p is None:
         return None
+    _is_credit = p.net_debit < 0
     return {
+        "limit_guidance": limit_price_guidance(
+            p.net_debit if not _is_credit else p.max_profit,
+            p.max_spread_pct, is_credit=_is_credit),
         "strategy": p.strategy,
         "expiry": p.expiry,
         "dte": p.dte,

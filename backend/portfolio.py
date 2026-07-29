@@ -40,7 +40,7 @@ import yfinance as yf
 from data.fetcher import get_ohlcv, get_current_price
 from signals.scorer import score_ticker
 from signals.options import (black_scholes, build_options_play, build_long_option,
-                             play_to_dict)
+                             build_credit_spread, play_to_dict)
 
 _PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
 _lock = threading.Lock()
@@ -143,13 +143,18 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
         in any broker, uncapped upside, whole premium at risk) or "spread" = a vertical
         debit spread (cheaper, capped both ways, multi-leg order).
         """
-        builder = build_long_option if structure == "single" else build_options_play
+        builder = {"single": build_long_option,
+                   "spread": build_options_play,
+                   "credit": build_credit_spread}.get(structure, build_long_option)
         fresh = builder(s["ticker"], s["signal"], s["entry"],
                         s["take_profit_1"], s["stop_loss"])
         op = play_to_dict(fresh)
         if op is None:
             return None
-        per_contract = op["net_debit"] * 100
+        # For a credit spread the capital committed is the max LOSS (collateral held),
+        # not a debit paid - net_debit is negative because money comes in.
+        per_contract = (op["max_loss"] * 100 if structure == "credit"
+                        else op["net_debit"] * 100)
         if per_contract <= 0:
             return None
         legs = op["legs"]
@@ -165,6 +170,8 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
             "net_debit": op["net_debit"],
             "per_contract": round(per_contract, 2),
             "max_profit": op["max_profit"],
+            "max_loss": op["max_loss"],
+            "limit_guidance": op.get("limit_guidance"),
             "breakeven": op["breakeven"],
             "risk_reward": op["risk_reward"],
             "prob_profit": op["prob_profit"],
@@ -262,20 +269,48 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
     n_calls = sum(d["contracts"] for d in items if d["kind"] == "call")
     n_puts = sum(d["contracts"] for d in items if d["kind"] == "put")
     wide_tickers = [d["ticker"] for d in items if d.get("wide_market")]
-    label = "call" if structure == "single" else "call-spread"
-    plabel = "put" if structure == "single" else "put-spread"
-    note = (f"Buy {n_calls} {label} + {n_puts} {plabel} contracts across "
-            f"{len(items)} position{'s' if len(items) != 1 else ''}. "
-            f"Most you can lose is ${cash:,.0f} (the full premium).")
+
+    if structure == "credit":
+        note = (f"Sell {len(items)} credit spread position{'s' if len(items) != 1 else ''} "
+                f"({n_calls + n_puts} contracts). ${cash:,.0f} held as collateral against "
+                f"the maximum loss; the credit received is yours to keep if the stocks "
+                f"stay put.")
+    else:
+        label = "call" if structure == "single" else "call-spread"
+        plabel = "put" if structure == "single" else "put-spread"
+        note = (f"Buy {n_calls} {label} + {n_puts} {plabel} contracts across "
+                f"{len(items)} position{'s' if len(items) != 1 else ''}. "
+                f"Most you can lose is ${cash:,.0f} (the full premium).")
+
+    # Explain an empty plan caused by affordability rather than signal quality - an
+    # unexplained blank list looks like a broken scanner.
+    if not items and (buy_drafts or sell_drafts):
+        cheapest = min((d["per_contract"] for d in buy_drafts + sell_drafts), default=0)
+        cap = budget * MAX_POSITION_PCT
+        note = (f"Signals passed the quality filters, but nothing fits this budget. "
+                f"The cheapest qualifying position needs ${cheapest:,.0f} per contract, "
+                f"and the per-position cap at a ${budget:,.0f} budget is ${cap:,.0f} "
+                f"(40%). "
+                + ("Credit spreads tie up collateral equal to their max loss, which is "
+                   "typically several hundred dollars per contract - they need a larger "
+                   "account than buying a single option does."
+                   if structure == "credit" else
+                   "Try a larger budget, or a cheaper structure."))
     if wide_tickers:
         note += (f" Note: {', '.join(wide_tickers)} has a wide bid/ask spread - "
                  "use a limit order, your fill may differ from the quote below.")
 
-    from signals.context import market_regime, premium_buying_environment
+    from signals.context import (market_regime, premium_buying_environment,
+                                 recommended_structure)
+    import risk as risk_mod
+    risk_state = risk_mod.to_dict(risk_mod.assess(_load(), starting_equity=budget))
     return {
         "budget": budget,
         "items": items,
+        "structure": structure,
         "environment": premium_buying_environment(),
+        "advice": recommended_structure(),
+        "risk": risk_state,
         "total_cost": round(cash, 2),
         "cash_left": round(budget - cash, 2),
         "n_call_contracts": n_calls,

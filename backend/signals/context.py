@@ -360,6 +360,44 @@ def premium_buying_environment() -> dict:
     return val
 
 
+def recommended_structure() -> dict:
+    """Which options structure suits today's market - the answer to "app says don't trade".
+
+    Buying premium and selling premium are opposite bets on the same variable. Long options
+    need movement; short options need the absence of it. A tool that only knows how to buy
+    has nothing to offer in the sideways tape that dominates most of the year, which is
+    exactly the condition the walk-forward backtest showed bleeding money.
+
+    Returns the structure to favour, so the planner can switch sides rather than sit out.
+    """
+    env = premium_buying_environment()
+    reg = market_regime()
+
+    if env["favourable"]:
+        rec = "single"
+        why = ("Conditions support BUYING premium: there is enough trend and volatility "
+               "for a directional move to pay for the time decay.")
+    else:
+        rec = "credit"
+        why = ("Conditions favour SELLING premium. The index is choppy and volatility is "
+               "low, which is what grinds long options down. Credit spreads get paid for "
+               "that same stillness - they win when the stock simply fails to travel far.")
+
+    return {
+        "recommended": rec,
+        "why": why,
+        "environment_favourable": env["favourable"],
+        "environment_note": env["note"],
+        "regime": reg.get("regime"),
+        "alternatives": {
+            "single": "Long call/put - needs a real move; whole premium at risk.",
+            "spread": "Debit spread - cheaper directional bet, capped both ways.",
+            "credit": "Credit spread - collect premium, win if the stock stays put; "
+                      "wins often, loses bigger, always defined-risk.",
+        },
+    }
+
+
 def regime_alignment(signal: str) -> dict:
     """Is this trade with or against the index trend?"""
     r = market_regime()

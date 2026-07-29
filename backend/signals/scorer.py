@@ -80,15 +80,24 @@ def _confidence(bull: float, bear: float, macro: float, n_triggers: int) -> int:
 
 
 def score_ticker(ticker: str, df: pd.DataFrame, macro_sentiment: float = 0.0,
-                 risk_budget: float = DEFAULT_RISK_BUDGET) -> "TradeSignal | None":
+                 risk_budget: float = DEFAULT_RISK_BUDGET,
+                 indicators_ready: bool = False) -> "TradeSignal | None":
+    """Score one ticker.
+
+    `indicators_ready=True` skips the indicator pass for callers that already computed
+    them. The walk-forward backtest scores the same ticker at hundreds of entry dates;
+    recomputing 16 indicator columns over full history each time turns a minutes-long
+    run into an hours-long one, and the values for any given bar are identical either way.
+    """
     if df is None or len(df) < 55:
         return None
 
-    try:
-        df = add_all_indicators(df)
-    except Exception as e:
-        print(f"[scorer] Indicator error for {ticker}: {e}")
-        return None
+    if not indicators_ready:
+        try:
+            df = add_all_indicators(df)
+        except Exception as e:
+            print(f"[scorer] Indicator error for {ticker}: {e}")
+            return None
 
     results: list[StrategyResult] = []
     for strategy in ALL_STRATEGIES:

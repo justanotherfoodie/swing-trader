@@ -223,6 +223,87 @@ def regime():
     return market_regime()
 
 
+@app.get("/api/risk")
+def risk_status(starting_equity: float = 600.0):
+    """Account-level risk: equity, drawdown, portfolio heat, circuit-breaker state."""
+    import risk as risk_mod
+    return risk_mod.to_dict(risk_mod.assess(portfolio._load(), starting_equity))
+
+
+@app.get("/api/advice")
+def advice():
+    """Which options structure suits today's market."""
+    from signals.context import recommended_structure
+    return recommended_structure()
+
+
+@app.get("/api/alerts")
+def alerts():
+    """Anything needing action right now, so you don't have to open the app to find out."""
+    import risk as risk_mod
+    out = []
+    for p in portfolio.evaluate():
+        if p["action"] in ("SELL", "SCALE"):
+            out.append({
+                "level": "action",
+                "ticker": p["ticker"],
+                "title": (f"SELL all {p['contracts']}" if p["action"] == "SELL"
+                          else f"SELL {p['sell_contracts']} of {p['contracts']}"),
+                "detail": p["reason"],
+                "pnl": p["pnl"], "pnl_pct": p["pnl_pct"],
+            })
+    r = risk_mod.assess(portfolio._load())
+    if r.status != "normal":
+        out.append({"level": "risk", "ticker": None,
+                    "title": f"Risk status: {r.status}",
+                    "detail": " ".join(r.messages), "pnl": None, "pnl_pct": None})
+    return {"alerts": out, "count": len(out)}
+
+
+@app.get("/api/review")
+def weekly_review(days: int = 7):
+    """What closed recently, and what the record says about it.
+
+    Most improvement comes from reviewing your own trades, not from better signals.
+    """
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    closed = []
+    for p in portfolio._load():
+        if p.get("status") != "closed" or not p.get("closed_at"):
+            continue
+        try:
+            when = datetime.fromisoformat(p["closed_at"])
+        except Exception:
+            continue
+        if when < cutoff:
+            continue
+        ctx = p.get("entry_context") or {}
+        closed.append({
+            "ticker": p["ticker"], "kind": p.get("kind"),
+            "closed_at": p["closed_at"],
+            "realized_pnl": p.get("realized_pnl"),
+            "strategies": ctx.get("strategies", []),
+            "quality_score": ctx.get("quality_score"),
+            "iv_verdict": ctx.get("iv_verdict"),
+            "warnings_at_entry": ctx.get("warnings", []),
+        })
+    tracked = [c for c in closed if c["realized_pnl"] is not None]
+    total = round(sum(c["realized_pnl"] for c in tracked), 2)
+    wins = len([c for c in tracked if c["realized_pnl"] > 0])
+    return {
+        "days": days,
+        "closed": closed,
+        "closed_count": len(closed),
+        "tracked_count": len(tracked),
+        "realized_pnl": total,
+        "wins": wins, "losses": len(tracked) - wins,
+        "prompt": ("For each loss: was it the signal, the entry price, the exit timing, "
+                   "or just the market? Only the first two are things you control."),
+        "performance": portfolio.performance_stats(),
+    }
+
+
 # ---------- Short-term momentum (1-3 day holds) ----------
 
 _momentum_cache: dict = {"signals": [], "scanned_at": None, "running": False}
