@@ -4,7 +4,7 @@ import { api, Plan, PlanItem, OpenPosition, Performance } from "@/lib/api";
 
 export function OptionsPlanner() {
   const [budget, setBudget] = useState(600);
-  const [structure, setStructure] = useState<"single" | "spread">("single");
+  const [structure, setStructure] = useState<"single" | "spread" | "credit">("single");
   const [plan, setPlan] = useState<Plan | null>(null);
   const [loadingPlan, setLoadingPlan] = useState(false);
   const [positions, setPositions] = useState<OpenPosition[]>([]);
@@ -98,30 +98,37 @@ export function OptionsPlanner() {
           />
         </div>
 
-        {/* Structure toggle — single long option vs vertical spread */}
+        {/* Structure toggle — buying premium vs selling it */}
         <div style={{ display: "flex", background: "#0d0f14", border: "1px solid #1e2330", borderRadius: 8, overflow: "hidden" }}>
-          {(["single", "spread"] as const).map((s) => (
-            <button
-              key={s}
-              onClick={() => setStructure(s)}
-              title={
-                s === "single"
-                  ? "One long call/put — two taps to buy, uncapped upside, whole premium at risk"
-                  : "Vertical debit spread — cheaper, capped both ways, multi-leg order"
-              }
-              style={{
-                background: structure === s ? "#1a2535" : "transparent",
-                color: structure === s ? "#60a5fa" : "#6b7280",
-                border: "none",
-                padding: "7px 12px",
-                fontSize: 12,
-                fontWeight: 600,
-                cursor: "pointer",
-              }}
-            >
-              {s === "single" ? "Single call/put" : "Spread"}
-            </button>
-          ))}
+          {(["single", "spread", "credit"] as const).map((s) => {
+            const label = s === "single" ? "Buy call/put" : s === "spread" ? "Debit spread" : "Sell credit";
+            const tip = {
+              single: "One long call/put — needs a real move; whole premium at risk",
+              spread: "Vertical debit spread — cheaper directional bet, capped both ways",
+              credit: "Credit spread — collect premium, win if the stock stays put. Wins often, loses bigger. Always defined-risk.",
+            }[s];
+            const isRec = plan?.advice?.recommended === s;
+            return (
+              <button
+                key={s}
+                onClick={() => setStructure(s)}
+                title={tip}
+                style={{
+                  background: structure === s ? "#1a2535" : "transparent",
+                  color: structure === s ? "#60a5fa" : "#6b7280",
+                  border: "none",
+                  padding: "7px 11px",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  position: "relative",
+                }}
+              >
+                {label}
+                {isRec && <span title="Recommended for today's market" style={{ color: "#00c896", marginLeft: 4 }}>★</span>}
+              </button>
+            );
+          })}
         </div>
 
         <button
@@ -146,9 +153,39 @@ export function OptionsPlanner() {
               </div>
             )}
           </div>
+          {/* Account-level risk. A halted or throttled account overrides every
+              individual signal below it. */}
+          {plan.risk && (plan.risk.status !== "normal" || plan.risk.undersized) && (
+            <div style={{
+              fontSize: 12,
+              color: plan.risk.status === "halted" ? "#ffb3c0" : "#ffd89b",
+              background: plan.risk.status === "halted" ? "rgba(255,77,109,0.1)" : "rgba(245,166,35,0.08)",
+              border: `1px solid ${plan.risk.status === "halted" ? "rgba(255,77,109,0.35)" : "rgba(245,166,35,0.3)"}`,
+              borderRadius: 6, padding: "10px 12px", marginBottom: 10, lineHeight: 1.55,
+            }}>
+              <b style={{ color: plan.risk.status === "halted" ? "#ff4d6d" : "#f5a623" }}>
+                {plan.risk.status === "halted" ? "🛑 Trading halted" :
+                 plan.risk.status === "throttled" ? "⚠ Size throttled" : "⚠ Account undersized"}
+              </b>
+              {" "}· equity ${plan.risk.equity.toLocaleString()} · drawdown {plan.risk.drawdown_pct}%
+              {" "}· heat {plan.risk.heat_pct}%/{plan.risk.max_heat_pct}%
+              {plan.risk.messages.map((m, i) => (
+                <div key={i} style={{ marginTop: 4, color: "#94a3b8" }}>{m}</div>
+              ))}
+            </div>
+          )}
+
+          {/* Which structure suits today — the answer to "app says don't trade". */}
+          {plan.advice && plan.advice.recommended !== plan.structure && (
+            <div style={{ fontSize: 12, color: "#c084fc", background: "rgba(192,132,252,0.08)", border: "1px solid rgba(192,132,252,0.3)", borderRadius: 6, padding: "9px 12px", marginBottom: 10, lineHeight: 1.5 }}>
+              <b>Consider &ldquo;{plan.advice.recommended === "credit" ? "Sell credit" : plan.advice.recommended === "single" ? "Buy call/put" : "Debit spread"}&rdquo; instead.</b>{" "}
+              {plan.advice.why}
+            </div>
+          )}
+
           {/* Environment check — the single most useful thing the app can say is
               "today is a bad day to buy premium at all". */}
-          {plan.environment && !plan.environment.favourable && (
+          {plan.environment && !plan.environment.favourable && structure !== "credit" && (
             <div style={{ fontSize: 12, color: "#ffb3c0", background: "rgba(255,77,109,0.1)", border: "1px solid rgba(255,77,109,0.35)", borderRadius: 6, padding: "10px 12px", marginBottom: 10, lineHeight: 1.55 }}>
               <b style={{ color: "#ff4d6d" }}>⛔ Poor conditions for buying options.</b>{" "}
               {plan.environment.note.replace("POOR conditions for buying options - consider sitting out or trading much smaller. ", "")}
@@ -316,6 +353,11 @@ function PlanRow({ it }: { it: PlanItem }) {
       {warns.length > 0 && (
         <div style={{ fontSize: 11, color: "#f5a623", marginTop: 3, marginLeft: 88, lineHeight: 1.5 }}>
           ⚠ {warns.join(" · ")}
+        </div>
+      )}
+      {it.limit_guidance && (
+        <div style={{ fontSize: 11, color: "#60a5fa", marginTop: 3, marginLeft: 88, lineHeight: 1.5 }}>
+          🎯 {it.limit_guidance.instruction}
         </div>
       )}
     </div>

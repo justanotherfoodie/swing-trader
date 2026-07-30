@@ -92,8 +92,9 @@ def _strikes(signal, entry, target, structure):
 
 
 def simulate(df, entry_date, long_k, short_k, kind, iv, entry_debit,
-             contracts, hold_days):
+             contracts, hold_days, stop_pct=None):
     """Replay the live exit ladder over the real price path. Returns net P&L after costs."""
+    stop_level = -(stop_pct if stop_pct is not None else STOP_LOSS_PCT) * 100
     future = df[df.index > entry_date].head(hold_days)
     if future.empty or entry_debit <= 0:
         return None
@@ -121,7 +122,7 @@ def simulate(df, entry_date, long_k, short_k, kind, iv, entry_debit,
             remaining -= n
             exit_reason = why
 
-        if pnl_pct <= -STOP_LOSS_PCT * 100:
+        if pnl_pct <= stop_level:
             bank(remaining, "STOP")
         elif peak >= TRAIL_ARM_PCT and pnl_pct <= trail_exit_level(peak):
             bank(remaining, "TRAIL")
@@ -179,7 +180,8 @@ def regime_at(spy: pd.DataFrame, date) -> str:
 
 
 def run(years=2, hold_days=5, budget=600.0, universe_size=200, step=5,
-        structure="single", picks=2, verbose=True):
+        structure="single", picks=2, verbose=True, exclude=None, min_quality=None,
+        stop_pct=None, split=False):
     print(f"\n{'='*74}")
     print(f"  WALK-FORWARD BACKTEST - {years}y, {hold_days}-day holds, "
           f"{structure} options, ${budget:,.0f}/window")
@@ -208,6 +210,24 @@ def run(years=2, hold_days=5, budget=600.0, universe_size=200, step=5,
         print("No data.")
         return
 
+    # Disabling a strategy has to happen at SCORING time, not by filtering trades after
+    # the fact: removing it changes the net score, which changes which signals fire at
+    # all. Post-hoc filtering would answer a different (and easier) question.
+    # The backtest drives strategy selection explicitly so it can always reproduce a
+    # true "all five" baseline, independent of whatever the live app currently disables.
+    import signals.strategies as strat_mod
+    from signals import scorer as scorer_mod
+    original_disabled = set(scorer_mod.DISABLED_STRATEGIES)
+    all_names = [f.__name__ for f in strat_mod.ALL_STRATEGIES]
+    if exclude:
+        drop = {x.lower() for x in exclude}
+        scorer_mod.DISABLED_STRATEGIES = {
+            n for n in all_names if any(d in n.lower() for d in drop)}
+    else:
+        scorer_mod.DISABLED_STRATEGIES = set()   # baseline = every strategy on
+    active = [n for n in all_names if n not in scorer_mod.DISABLED_STRATEGIES]
+    print(f"  Strategies active: {len(active)}/{len(all_names)} ({', '.join(active)})")
+
     spy = get_ohlcv("SPY", period=period)
     calendar = sorted(set().union(*[set(df.index) for df in list(data.values())[:40]]))
     # Leave room at the start for indicator warm-up and at the end for the hold.
@@ -226,6 +246,8 @@ def run(years=2, hold_days=5, budget=600.0, universe_size=200, step=5,
                 continue
             sig = score_ticker(tk, hist, 0.0, indicators_ready=True)
             if sig is None or sig.signal == "WATCH":
+                continue
+            if min_quality and sig.quality not in min_quality:
                 continue
             cands.append((tk, sig, hist))
 
@@ -255,7 +277,8 @@ def run(years=2, hold_days=5, budget=600.0, universe_size=200, step=5,
             n = int(per_trade / (debit * 100))
             if n < 1:
                 continue
-            res = simulate(data[tk], d, long_k, short_k, kind, iv, debit, n, hold_days)
+            res = simulate(data[tk], d, long_k, short_k, kind, iv, debit, n, hold_days,
+                           stop_pct=stop_pct)
             if res is None:
                 continue
             trades.append({
@@ -268,9 +291,32 @@ def run(years=2, hold_days=5, budget=600.0, universe_size=200, step=5,
         if verbose and (i + 1) % 25 == 0:
             print(f"  ...{i+1}/{len(entry_dates)} windows, {len(trades)} trades so far")
 
+    scorer_mod.DISABLED_STRATEGIES = original_disabled   # restore global state
+
     if not trades:
         print("No trades generated.")
         return
+
+    if split:
+        # In-sample / out-of-sample. Any change that only helps on the data used to
+        # invent it is noise dressed up as insight. The out-of-sample half is the only
+        # part that carries information about the future.
+        trades.sort(key=lambda t: t["date"])
+        cut = int(len(trades) * 0.66)
+        is_t, oos_t = trades[:cut], trades[cut:]
+        print(f"\n{'#'*74}")
+        print(f"  IN-SAMPLE ({len(is_t)} trades, through {is_t[-1]['date'].date()})")
+        print(f"{'#'*74}")
+        _report(is_t, budget, structure, brief=True)
+        print(f"\n{'#'*74}")
+        print(f"  OUT-OF-SAMPLE ({len(oos_t)} trades, from {oos_t[0]['date'].date()})"
+              f"  <-- the honest test")
+        print(f"{'#'*74}")
+        _report(oos_t, budget, structure, brief=True)
+        print(f"\n{'#'*74}")
+        print("  COMBINED")
+        print(f"{'#'*74}")
+
     _report(trades, budget, structure)
     return trades
 
@@ -296,13 +342,19 @@ def _stats(pnls: list[float], bases: list[float]) -> dict:
     }
 
 
-def _report(trades: list[dict], budget: float, structure: str):
+def _report(trades: list[dict], budget: float, structure: str, brief: bool = False):
     pnls = [t["net"] for t in trades]
     bases = [t["cost_basis"] for t in trades]
     gross_pnls = [t["gross"] for t in trades]
     s = _stats(pnls, bases)
     sg = _stats(gross_pnls, bases)
     costs = sum(t["costs"] for t in trades)
+
+    if brief:
+        print(f"  Trades {s['n']} | win {s['win_rate']:.1f}% | "
+              f"EXPECTANCY ${s['expectancy']:+.2f} | PF {s['profit_factor']:.2f} | "
+              f"net ${s['total']:+,.2f}")
+        return
 
     print(f"\n{'='*74}")
     print("  OVERALL")
@@ -371,6 +423,15 @@ if __name__ == "__main__":
     ap.add_argument("--step", type=int, default=5, help="trading days between entry dates")
     ap.add_argument("--structure", choices=["single", "spread"], default="single")
     ap.add_argument("--picks", type=int, default=2, help="positions per direction per window")
+    ap.add_argument("--exclude", nargs="*", default=None,
+                    help="strategy function-name fragments to disable, e.g. macd rsi_mean")
+    ap.add_argument("--min-quality", nargs="*", default=None,
+                    help="only take these signal qualities, e.g. high medium")
+    ap.add_argument("--stop-pct", type=float, default=None,
+                    help="override stop loss as a fraction, e.g. 0.6 for -60%%")
+    ap.add_argument("--split", action="store_true",
+                    help="report in-sample vs out-of-sample separately")
     a = ap.parse_args()
     run(years=a.years, hold_days=a.hold_days, budget=a.budget,
-        universe_size=a.universe, step=a.step, structure=a.structure, picks=a.picks)
+        universe_size=a.universe, step=a.step, structure=a.structure, picks=a.picks,
+        exclude=a.exclude, min_quality=a.min_quality, stop_pct=a.stop_pct, split=a.split)

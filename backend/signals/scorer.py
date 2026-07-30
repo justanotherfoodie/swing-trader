@@ -19,7 +19,32 @@ Signal thresholds (net directional score):
 from dataclasses import dataclass
 import pandas as pd
 from .indicators import add_all_indicators, find_support_resistance
-from .strategies import ALL_STRATEGIES, StrategyResult
+from . import strategies as _strategies
+from .strategies import StrategyResult
+
+# ---- Evidence-driven strategy selection ---------------------------------------
+# MACD+RSI Confluence is disabled based on a walk-forward test over 3 years and 250
+# tickers, with commission and slippage modelled:
+#
+#   baseline (all 5)      in-sample -$8.70/trade   out-of-sample  +$6.85   combined -$3.27
+#   without MACD+RSI      in-sample -$3.23/trade   out-of-sample +$25.76   combined +$6.76
+#
+# It improved BOTH halves, which is the bar a change has to clear here - two other
+# candidate changes improved only the in-sample half and were rejected as curve-fitting.
+# A narrower fix that neutralised only the strategy's weakest branch was also tested and
+# made things worse, which located the problem in its crossover triggers themselves.
+#
+# Honest limits: ~30 out-of-sample trades cannot establish a profit factor of 2.87, and
+# the strategy was singled out for testing because it looked bad in this same data. Treat
+# this as "the best-supported call available", not as a settled fact. Set to an empty set
+# to restore all five.
+DISABLED_STRATEGIES = {"macd_rsi_confluence"}
+
+
+def active_strategies():
+    """Strategies actually used for scoring, after evidence-based exclusions."""
+    return [f for f in _strategies.ALL_STRATEGIES
+            if f.__name__ not in DISABLED_STRATEGIES]
 
 # Default risk per trade in account currency. Tune to your account size
 # (1-2% of equity is the common rule; $200 ~= 1% of a $20k account).
@@ -100,7 +125,7 @@ def score_ticker(ticker: str, df: pd.DataFrame, macro_sentiment: float = 0.0,
             return None
 
     results: list[StrategyResult] = []
-    for strategy in ALL_STRATEGIES:
+    for strategy in active_strategies():
         try:
             results.append(strategy(df))
         except Exception as e:

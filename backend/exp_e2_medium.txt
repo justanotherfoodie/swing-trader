@@ -1,0 +1,100 @@
+
+==========================================================================
+  WALK-FORWARD BACKTEST - 3y, 5-day holds, single options, $600/window
+  Costs: $0.65/contract/side + 2% slippage each way
+==========================================================================
+[universe] Loaded 909 tickers (S&P 500 + Nasdaq-100 + MidCap 400, deduplicated)
+  249 tickers | 259 entry dates (2023-06-15 -> 2026-07-20)
+
+  ...25/259 windows, 16 trades so far
+  ...50/259 windows, 32 trades so far
+  ...75/259 windows, 49 trades so far
+  ...100/259 windows, 62 trades so far
+  ...125/259 windows, 75 trades so far
+  ...150/259 windows, 88 trades so far
+  ...175/259 windows, 91 trades so far
+  ...200/259 windows, 102 trades so far
+  ...225/259 windows, 116 trades so far
+  ...250/259 windows, 120 trades so far
+
+##########################################################################
+  IN-SAMPLE (81 trades, through 2025-02-10)
+##########################################################################
+  Trades 81 | win 54.3% | EXPECTANCY $+9.95 | PF 1.34 | net $+805.68
+
+##########################################################################
+  OUT-OF-SAMPLE (42 trades, from 2025-02-13)  <-- the honest test
+##########################################################################
+  Trades 42 | win 47.6% | EXPECTANCY $-9.59 | PF 0.82 | net $-402.58
+
+##########################################################################
+  COMBINED
+##########################################################################
+
+==========================================================================
+  OVERALL
+==========================================================================
+  Trades:            123
+  Win rate:          52.0%
+  Average win:       $+77.80
+  Average loss:      $-77.56
+  EXPECTANCY/trade:  $+3.28   <-- the number that matters
+  Profit factor:     1.09   (>1.0 = profitable)
+  Return on capital: +1.7%
+  Net P&L:           $+403.10
+
+  Before costs:      $+1,578.32  (expectancy $+12.83)
+  Total costs:       $1,175.29
+  --> costs turned the result worse
+  Max drawdown:      $-1,152.99
+
+--------------------------------------------------------------------------
+  BY MARKET REGIME
+--------------------------------------------------------------------------
+                          trades    win%   expectancy        total
+  bull_trend                  57   54.4%       +7.88     +449.27
+  chop                        50   50.0%       +2.18     +109.16
+  mixed                       16   50.0%       -9.71     -155.33
+
+--------------------------------------------------------------------------
+  BY SIGNAL QUALITY
+--------------------------------------------------------------------------
+                          trades    win%   expectancy        total
+  medium                     123   52.0%       +3.28     +403.10
+
+--------------------------------------------------------------------------
+  BY DIRECTION
+--------------------------------------------------------------------------
+                          trades    win%   expectancy        total
+  call                        79   55.7%      +14.69    +1160.23
+  put                         44   45.5%      -17.21     -757.13
+
+--------------------------------------------------------------------------
+  BY STRATEGY (a trade counts once per strategy that fired)
+--------------------------------------------------------------------------
+                          trades    win%   expectancy        total
+  BB Squeeze Breakout         36   66.7%      +47.05    +1693.64
+  EMA50+BB Trend              84   52.4%       +3.31     +278.08
+  EMA 9/21 Crossover         109   52.3%       +1.25     +136.72
+  MACD+RSI Confluence         93   50.5%       +0.35      +32.96
+  RSI Mean Reversion          12   41.7%      -22.30     -267.61
+
+--------------------------------------------------------------------------
+  BY EXIT REASON
+--------------------------------------------------------------------------
+                          trades    win%   expectancy        total
+  TIER3                        9  100.0%     +230.16    +2071.41
+  TIER1                        2  100.0%      +84.35     +168.71
+  TIER2                        4  100.0%      +82.99     +331.95
+  TAKE                        34  100.0%      +57.10    +1941.44
+  TRAIL                       15   60.0%      +23.20     +347.94
+  TIME                        26   23.1%      -32.82     -853.30
+  STOP                        33    0.0%     -109.24    -3605.05
+
+==========================================================================
+  VERDICT: EDGE PRESENT after costs.
+==========================================================================
+  Caveats: Black-Scholes pricing with realized-vol as IV proxy, held constant.
+  Does not model IV expansion/crush or assignment. Past results do not
+  guarantee anything about the future. Not financial advice.
+

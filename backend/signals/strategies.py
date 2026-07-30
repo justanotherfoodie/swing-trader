@@ -116,7 +116,13 @@ def macd_rsi_confluence(df: pd.DataFrame) -> StrategyResult:
         return StrategyResult("MACD+RSI Confluence", -1, -1.0,
                               f"MACD bearish cross, RSI={rsi:.1f}", is_trigger=True)
 
-    # Histogram momentum = context, NOT a fresh trigger
+    # Histogram momentum = context, NOT a fresh trigger.
+    #
+    # Tested neutralising this branch on the theory that its low-conviction nudge was
+    # diluting the signal pool. It made results WORSE (-$5.16/trade vs -$3.27 baseline),
+    # so the theory was wrong: the damage in this strategy comes from the crossover
+    # triggers above, not from this. Left at its original weight - see DISABLED_STRATEGIES
+    # in signals/scorer.py for how the evidence was actually acted on.
     if hist > 0 and hist > hist_prev and macd > sig and 40 <= rsi <= 60:
         return StrategyResult("MACD+RSI Confluence", 1, 0.6,
                               f"MACD above signal, momentum building, RSI={rsi:.1f}", is_trigger=False)

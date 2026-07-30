@@ -118,6 +118,8 @@ export interface PlanItem {
   max_spread_pct?: number;
   quality_score?: number;
   warnings?: string[];
+  max_loss?: number;
+  limit_guidance?: LimitGuidance | null;
   delta?: number;
   open_interest?: number;
   iv_verdict?: string;
@@ -135,6 +137,40 @@ export interface Regime {
   spy: number | null;
   ema50: number | null;
   ema200: number | null;
+}
+
+export interface RiskStatus {
+  equity: number;
+  peak_equity: number;
+  drawdown_pct: number;
+  open_positions: number;
+  open_risk: number;
+  heat_pct: number;
+  max_heat_pct: number;
+  consecutive_losses: number;
+  size_multiplier: number;
+  can_trade: boolean;
+  risk_per_trade: number;
+  status: "normal" | "throttled" | "halted";
+  messages: string[];
+  undersized: boolean;
+  implied_risk_pct: number;
+}
+
+export interface StructureAdvice {
+  recommended: "single" | "spread" | "credit";
+  why: string;
+  environment_favourable: boolean;
+  environment_note: string;
+  regime: string;
+  alternatives: Record<string, string>;
+}
+
+export interface LimitGuidance {
+  start: number;
+  fair: number;
+  worst_acceptable: number;
+  instruction: string;
 }
 
 export interface Environment {
@@ -172,6 +208,9 @@ export interface Plan {
   regime?: Regime;
   rejected?: RejectedPick[];
   environment?: Environment;
+  structure?: "single" | "spread" | "credit";
+  advice?: StructureAdvice;
+  risk?: RiskStatus;
 }
 
 export interface OpenPosition {
@@ -265,8 +304,10 @@ export const api = {
   triggerScan: () =>
     fetch(`${API_BASE}/api/scan`, { method: "POST" }).then((r) => r.json()),
   getStatus: () => apiFetch<StatusResult>("/api/status"),
-  buildPlan: (budget: number, structure: "single" | "spread" = "single") =>
+  buildPlan: (budget: number, structure: "single" | "spread" | "credit" = "single") =>
     apiPost<Plan>("/api/plan", { budget, structure }),
+  getRisk: () => apiFetch<RiskStatus>("/api/risk"),
+  getAdvice: () => apiFetch<StructureAdvice>("/api/advice"),
   savePositions: (items: PlanItem[]) =>
     apiPost<{ status: string; count: number }>("/api/positions", { items }),
   getPositions: () => apiFetch<{ positions: OpenPosition[] }>("/api/positions"),
