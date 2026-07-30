@@ -277,6 +277,7 @@ class CloseRequest(BaseModel):
 class ScaleRequest(BaseModel):
     contracts: int
     exit_value: float | None = None
+    tier: str | None = None      # which ladder rung fired ("t1"/"t2"), from evaluate()
 
 
 class UpdateRequest(BaseModel):
@@ -292,7 +293,7 @@ def close_pos(pos_id: str, req: CloseRequest | None = None):
 @app.post("/api/positions/{pos_id}/scale")
 def scale_pos(pos_id: str, req: ScaleRequest):
     """Sell part of a position (profit-ladder tier) and keep the rest open."""
-    portfolio.scale_out(pos_id, req.contracts, req.exit_value)
+    portfolio.scale_out(pos_id, req.contracts, req.exit_value, tier=req.tier)
     return {"status": "scaled", "id": pos_id, "contracts_sold": req.contracts}
 
 
@@ -307,6 +308,19 @@ def edit_pos(pos_id: str, req: UpdateRequest):
 def performance():
     """Realized track record + per-strategy attribution."""
     return portfolio.performance_stats()
+
+
+@app.get("/api/health/data")
+def data_health():
+    """Upstream feed health.
+
+    Without this, a rate-limited or down market-data feed is indistinguishable from
+    a genuinely quiet market - the app would show "no signals today" when the truth
+    is "I could not see the market". That is the difference between a tool that is
+    honest and one that is dangerous.
+    """
+    from data.resilience import get_data_health
+    return get_data_health()
 
 
 @app.get("/api/regime")

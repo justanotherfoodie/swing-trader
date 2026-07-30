@@ -5,7 +5,15 @@ backend/.env
 !.env.example
 
 # Personal trading data — never commit
+# Live trading data and everything the durability layer writes alongside it.
+# These contain real positions and P&L - never commit them.
 backend/portfolio.json
+backend/portfolio.json.[1-9]
+backend/portfolio.json.corrupt-*
+backend/portfolio.json.lock
+backend/portfolio.json.*.bak
+backend/portfolio.json.safety-*
+backend/portfolio.quarantine.json
 backend/*.json
 !backend/requirements.txt
 

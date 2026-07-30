@@ -1,11 +1,26 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-yfinance==0.2.40
-pandas==2.2.2
-numpy==1.26.4
-anthropic==0.34.0
-httpx==0.27.2
-python-dotenv==1.0.1
-apscheduler==3.10.4
-requests==2.32.3
-beautifulsoup4==4.12.3
+# Pins reflect the versions this code is ACTUALLY developed and tested against.
+#
+# These were previously wrong by whole major versions - the file claimed
+# yfinance 0.2.40 / pandas 2.2.2 / numpy 1.26.4 while the app ran on
+# yfinance 1.4.1 / pandas 3.0.3 / numpy 2.4.6. That gap was not cosmetic: yfinance
+# restructured its news payload between 0.2 and 1.x, so the news fallback silently
+# returned empty headlines. Anyone installing from the old pins - including a Docker
+# build - got a materially different application from the one that was tested.
+#
+# Upper bounds allow patch fixes but block the next major, which is where the
+# breaking changes live.
+
+fastapi>=0.138,<0.139
+uvicorn>=0.49,<0.50
+yfinance>=1.4.1,<2.0
+pandas>=3.0,<4.0
+numpy>=2.4,<3.0
+anthropic>=0.111,<1.0
+httpx>=0.28,<0.29
+python-dotenv>=1.2,<2.0
+apscheduler>=3.11,<4.0
+requests>=2.34,<3.0
+beautifulsoup4>=4.15,<5.0
+
+# Testing
+pytest>=9.1,<10.0

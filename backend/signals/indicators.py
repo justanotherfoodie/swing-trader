@@ -11,13 +11,28 @@ def _ema(series: pd.Series, length: int) -> pd.Series:
 
 
 def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    """Wilder's RSI.
+
+    The zero-average-loss case has to be handled explicitly. Dividing by NaN there
+    propagates NaN into the result, and because every comparison against NaN is False,
+    the overbought branch of the RSI strategy could never fire on exactly the strongest
+    uptrends - the ones where it matters most. A window with no down-closes is RSI 100
+    by definition; a flat window with neither gains nor losses is undefined and is
+    reported as the neutral 50 rather than NaN.
+    """
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=length - 1, adjust=False).mean()
     avg_loss = loss.ewm(com=length - 1, adjust=False).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+
+    no_loss = avg_loss == 0
+    rsi = rsi.mask(no_loss & (avg_gain > 0), 100.0)   # pure uptrend -> 100
+    rsi = rsi.mask(no_loss & (avg_gain == 0), 50.0)   # perfectly flat -> neutral
+    return rsi
 
 
 def _macd(series: pd.Series, fast=12, slow=26, signal=9):

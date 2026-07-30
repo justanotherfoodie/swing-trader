@@ -28,7 +28,7 @@ Exit rules (the "when to sell" brain), checked in priority order:
   else        - HOLD, with progress toward target
 """
 
-import json
+import contextlib
 import os
 import threading
 import uuid
@@ -37,13 +37,22 @@ from datetime import datetime, timezone
 import numpy as np
 import yfinance as yf
 
+import storage
 from data.fetcher import get_ohlcv, get_current_price
 from signals.scorer import score_ticker
 from signals.options import (black_scholes, build_options_play, build_long_option,
                              build_credit_spread, play_to_dict)
 
 _PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
-_lock = threading.Lock()
+_QUARANTINE_FILE = os.path.join(os.path.dirname(__file__), "portfolio.quarantine.json")
+
+# Re-entrant so a mutator can hold the transaction lock and still call _load()/_save()
+# without deadlocking itself. In-process only - see _file_lock for the other half.
+_lock = threading.RLock()
+
+# The cross-process half: uvicorn --reload runs more than one process, and the user
+# also runs backtests and scripts against this same file.
+_file_lock = storage.FileLock(_PORTFOLIO_FILE)
 
 TAKE_PROFIT_PCT = 0.70    # captured this share of max profit -> take it
 STOP_LOSS_PCT = 0.40      # lost this share of premium -> cut it (was 0.50; long options
@@ -91,19 +100,67 @@ MAX_PER_SECTOR = 1
 
 # ---------- persistence ----------
 
+@contextlib.contextmanager
+def _transaction():
+    """Hold both locks for a read-modify-write cycle.
+
+    Every mutator does load -> mutate -> save. Without a lock spanning the WHOLE
+    cycle, two writers can both read the same list and the second save silently
+    erases the first one's position. The thread lock covers this interpreter; the
+    lockfile covers the other uvicorn worker / backtest script.
+    """
+    with _lock:
+        try:
+            _file_lock.acquire()
+        except Exception as e:                      # never block a user's write
+            print(f"[portfolio] file lock unavailable ({e}); proceeding in-process only")
+            yield
+            return
+        try:
+            yield
+        finally:
+            _file_lock.release()
+
+
 def _load() -> list[dict]:
-    if not os.path.exists(_PORTFOLIO_FILE):
-        return []
-    try:
-        with open(_PORTFOLIO_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return []
+    """Every position on record. Same name, same return type as before.
+
+    Three behaviour changes, all in the direction of not losing money data:
+      - an unparseable primary file recovers from the newest valid backup instead
+        of silently returning [] (which made the app look like the account was empty)
+      - records that would crash the exit brain are quarantined to a side file
+        rather than dropped or allowed through
+      - the read is taken under the cross-process lock, so it can never observe a
+        file mid-swap
+    """
+    with _transaction():
+        records, source = storage.load_json_resilient(_PORTFOLIO_FILE)
+        if source and source != _PORTFOLIO_FILE:
+            print(f"[portfolio] RECOVERED {len(records)} positions from backup {source} "
+                  "after the main file failed to parse - please verify your positions.")
+        valid, invalid = storage.validate_positions(records, _QUARANTINE_FILE)
+        if invalid:
+            print(f"[portfolio] {len(invalid)} malformed record(s) moved to "
+                  f"{os.path.basename(_QUARANTINE_FILE)}; they were NOT deleted.")
+        return valid
 
 
-def _save(positions: list[dict]):
-    with open(_PORTFOLIO_FILE, "w") as f:
-        json.dump(positions, f, indent=2)
+def _save(positions: list[dict], backups: int = storage.BACKUP_COUNT):
+    """Durably replace the position file: rolling backups + atomic swap.
+
+    A crash at any instant leaves either the previous complete file or the new
+    complete one - json.dump into an open handle could leave neither.
+
+    `backups=0` skips rotation. That matters more than it looks: evaluate() rewrites
+    this file whenever a position's high-water mark ticks, which for an open position
+    in a moving market is roughly every 60-second dashboard poll. Rotating five copies
+    that often fills the entire backup set with near-identical states from the last few
+    minutes - so a corruption discovered ten minutes later would have nothing good to
+    recover from. Rotation is reserved for real state changes (open/close/scale/edit);
+    the atomic swap alone still protects every write.
+    """
+    with _transaction():
+        storage.atomic_write_json(_PORTFOLIO_FILE, positions, backups=backups)
 
 
 # ---------- plan building ----------
@@ -330,8 +387,10 @@ def build_plan(budget: float, signals: list[dict], picks_per_side: int = 2,
 def open_positions(items: list[dict]) -> list[dict]:
     """Persist the spreads the user actually bought."""
     now = datetime.now(timezone.utc).isoformat()
-    positions = _load()
-    with _lock:
+    with _transaction():
+        # Load INSIDE the transaction: reading before taking the lock is what lets a
+        # concurrent writer's positions get overwritten by our stale copy.
+        positions = _load()
         for it in items:
             positions.append({
                 "id": uuid.uuid4().hex[:8],
@@ -374,8 +433,8 @@ def open_positions(items: list[dict]) -> list[dict]:
 
 def close_position(pos_id: str, exit_value: float | None = None):
     """Close a position fully. `exit_value` is total $ received, for realized-P&L stats."""
-    positions = _load()
-    with _lock:
+    with _transaction():
+        positions = _load()
         for p in positions:
             if p["id"] == pos_id:
                 p["status"] = "closed"
@@ -393,15 +452,16 @@ def close_position(pos_id: str, exit_value: float | None = None):
     return _load()
 
 
-def scale_out(pos_id: str, contracts_sold: int, exit_value: float | None = None):
+def scale_out(pos_id: str, contracts_sold: int, exit_value: float | None = None,
+              tier: str | None = None):
     """Sell PART of a position and keep the rest open.
 
     This is what makes the profit ladder real: banking half at +25% is only possible if
     the tracker can hold a partially-closed position. Records the realized piece and
     marks which ladder rung was taken so the same tier doesn't fire again.
     """
-    positions = _load()
-    with _lock:
+    with _transaction():
+        positions = _load()
         for p in positions:
             if p["id"] != pos_id:
                 continue
@@ -412,8 +472,18 @@ def scale_out(pos_id: str, contracts_sold: int, exit_value: float | None = None)
                 realized = round(float(exit_value) - cost_of_sold, 2)
                 p["realized_pnl"] = round(p.get("realized_pnl", 0.0) + realized, 2)
             p["contracts"] -= sold
+            # Record the tier that ACTUALLY fired. Labelling by count instead meant a
+            # tier-2 scale was written down as "t1", leaving t2 unmarked and free to
+            # fire again on the remaining contracts - selling the runner a second time
+            # at a rung that had already been taken. When the tier is known, mark it and
+            # every lower one, since you cannot reach tier 2 without passing tier 1.
             rungs = set(p.get("scaled_out", []))
-            rungs.add("t1" if "t1" not in rungs else "t2")
+            if tier in ("t1", "t2"):
+                rungs.add("t1")
+                if tier == "t2":
+                    rungs.add("t2")
+            else:
+                rungs.add("t1" if "t1" not in rungs else "t2")
             p["scaled_out"] = sorted(rungs)
             p.setdefault("partial_exits", []).append({
                 "contracts": sold,
@@ -438,8 +508,8 @@ def update_position(pos_id: str, fields: dict):
     """
     allowed = {"ticker", "kind", "expiry", "long_strike", "short_strike", "net_debit",
                "contracts", "entry_spot", "target", "stop", "strategy", "peak_pnl_pct"}
-    positions = _load()
-    with _lock:
+    with _transaction():
+        positions = _load()
         for p in positions:
             if p["id"] == pos_id:
                 for k, v in fields.items():
@@ -447,7 +517,12 @@ def update_position(pos_id: str, fields: dict):
                         p[k] = v
                 if "short_strike" in fields and fields["short_strike"] is None:
                     p["strategy"] = f"Long {p['kind'].upper()}"
-                p["peak_pnl_pct"] = float(fields.get("peak_pnl_pct", 0.0))
+                # Only touch the high-water mark if the caller actually supplied one.
+                # Resetting it to 0 on every edit silently disarmed the trailing
+                # profit-lock: correcting an unrelated field (say, a wrong strike) would
+                # wipe the peak, so a position already up 60% would stop being protected.
+                if "peak_pnl_pct" in fields:
+                    p["peak_pnl_pct"] = float(fields["peak_pnl_pct"])
         _save(positions)
     return _load()
 
@@ -562,7 +637,14 @@ def _spread_mark(ticker, expiry, long_k, short_k, kind, spot, dte) -> float:
 
 
 def _evaluate_one(p: dict) -> dict:
-    spot = get_current_price(p["ticker"]) or p["entry_spot"]
+    # Falling back to the entry price when the feed is down is quietly dangerous: the
+    # position then marks at exactly break-even and the exit brain concludes "nothing is
+    # happening" - so a stop that has genuinely been breached never fires. Fall back so
+    # the app still renders, but flag it loudly rather than presenting a fabricated P&L
+    # as real.
+    live_spot = get_current_price(p["ticker"])
+    stale_price = live_spot is None
+    spot = live_spot if live_spot is not None else p["entry_spot"]
     today = datetime.now(timezone.utc).date()
     exp = datetime.strptime(p["expiry"], "%Y-%m-%d").date()
     dte = (exp - today).days
@@ -595,6 +677,7 @@ def _evaluate_one(p: dict) -> dict:
 
     # ---- exit rules, priority order ----
     action, reason, urgency = "HOLD", "", "watch"
+    fired_tier: str | None = None
     is_call = p["kind"] == "call"
 
     broke_stop = (spot <= p["stop"]) if is_call else (spot >= p["stop"])
@@ -639,12 +722,12 @@ def _evaluate_one(p: dict) -> dict:
                   "so take the whole profit now. A 30% option gain in a few days is a good "
                   "trade; don't wait for the double.")
     elif contracts >= 2 and pnl_pct >= TIER2_PCT and "t2" not in done:
-        action, urgency = "SCALE", "now"
+        action, urgency, fired_tier = "SCALE", "now", "t2"
         sell_contracts = max(1, (contracts + 1) // 2)
         reason = (f"Up {pnl_pct:.0f}% — take tier 2: sell {sell_contracts} of {contracts}. "
                   "Bank the bulk of the move, keep a runner in case it keeps going.")
     elif contracts >= 2 and pnl_pct >= TIER1_PCT and "t1" not in done:
-        action, urgency = "SCALE", "now"
+        action, urgency, fired_tier = "SCALE", "now", "t1"
         sell_contracts = contracts // 2
         reason = (f"Up {pnl_pct:.0f}% — take tier 1: sell {sell_contracts} of {contracts}. "
                   "This locks in real money and makes the rest of the trade close to free.")
@@ -692,8 +775,15 @@ def _evaluate_one(p: dict) -> dict:
         "pct_of_max": round(max(0.0, pct_of_max) * 100),
         "action": action,
         "urgency": urgency,
-        "reason": reason,
+        "reason": (
+            "PRICE FEED UNAVAILABLE - this position is marked at its entry price, so the "
+            "P&L above is a placeholder, not a real valuation. Do not act on it. "
+            f"(Underlying verdict, computed on stale data: {reason})"
+            if stale_price else reason
+        ),
+        "stale_price": stale_price,
         "sell_contracts": sell_contracts if action in ("SELL", "SCALE") else 0,
+        "tier": fired_tier,
         "structure": "single" if short_k is None else "spread",
         "scaled_out": sorted(done),
     }
@@ -707,7 +797,7 @@ def evaluate() -> list[dict]:
     """
     all_positions = _load()
     out = []
-    dirty = False
+    peaks: dict[str, float] = {}
     for p in all_positions:
         if p.get("status") != "open":
             continue
@@ -715,11 +805,20 @@ def evaluate() -> list[dict]:
             result = _evaluate_one(p)
             out.append(result)
             if result["peak_pnl_pct"] != p.get("peak_pnl_pct", 0.0):
-                p["peak_pnl_pct"] = result["peak_pnl_pct"]
-                dirty = True
+                peaks[p["id"]] = result["peak_pnl_pct"]
         except Exception as e:
             print(f"[portfolio] eval error {p.get('ticker')}: {e}")
-    if dirty:
-        with _lock:
-            _save(all_positions)
+
+    # Write back only the high-water marks, against a FRESH read taken under the
+    # lock. Evaluating takes seconds of network calls; saving the stale snapshot
+    # we loaded before all that would undo any position the user closed meanwhile.
+    if peaks:
+        with _transaction():
+            current = _load()
+            for p in current:
+                if p["id"] in peaks:
+                    p["peak_pnl_pct"] = peaks[p["id"]]
+            # No backup rotation here - this is a high-frequency bookkeeping write, and
+            # rotating on every poll would flush the recovery window (see _save).
+            _save(current, backups=0)
     return out

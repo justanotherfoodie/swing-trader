@@ -1,0 +1,48 @@
+# Secrets - must never enter the build context
+.env
+*.env
+!.env.example
+backend/.env
+
+# Personal trading data
+backend/portfolio.json
+backend/*_test.json
+
+# VCS / tooling
+.git
+.gitignore
+.github
+.claude
+.vscode
+.idea
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next.js - reinstalled and rebuilt inside the image
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+**/*.tsbuildinfo
+
+# Windows launchers and docs - not needed in a Linux image
+*.bat
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Logs / OS junk
+*.log
+backend/server.log
+.DS_Store
+Thumbs.db

@@ -178,8 +178,12 @@ MIN_CREDIT_FRAC = 0.12
 def _bs_delta(spot: float, strike: float, dte: int, iv: float, kind: str) -> float:
     """Black-Scholes delta - how much the option moves per $1 move in the stock."""
     if dte <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
-        intrinsic = (spot > strike) if kind == "call" else (spot < strike)
-        return 1.0 if intrinsic else 0.0
+        # At expiry delta collapses to 0 or +/-1. A put's delta is NEGATIVE: it gains
+        # as the underlying falls. Returning +1.0 here made an expiring ITM put look
+        # like a long stock position to anything reading the sign.
+        if kind == "call":
+            return 1.0 if spot > strike else 0.0
+        return -1.0 if spot < strike else 0.0
     T = dte / 365.0
     d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * math.sqrt(T))
     nd1 = _norm_cdf(d1)

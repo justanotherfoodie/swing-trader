@@ -1,6 +1,10 @@
 @echo off
 title Trader Dashboard
-cd /d "C:\Users\gongy\OneDrive\Desktop\Trader\frontend"
+setlocal
+
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+cd /d "%ROOT%\frontend"
 
 echo ============================================
 echo  Trader Dashboard - http://localhost:3000
@@ -18,10 +22,11 @@ if errorlevel 1 (
 
 echo.
 echo Installing packages (first time only)...
-npm install
+call npm install
 
 echo.
 echo Starting dashboard on http://localhost:3000
-npm run dev
+call npm run dev
 
 pause
+endlocal
