@@ -1,15 +1,64 @@
-"""FastAPI backend — exposes scanner results as REST endpoints."""
+"""FastAPI backend - exposes scanner results as REST endpoints.
 
+Security posture: this binds to 0.0.0.0 so the dashboard can reach it, which means
+anything on the local network can too. The API can read a real trading history and
+mutate positions, so it is not safe to leave completely open. Mitigations here:
+
+  * Optional shared-secret auth (set API_TOKEN in .env to require it on writes).
+  * Rate limiting, so a runaway frontend loop or a stray script cannot hammer the
+    yfinance-backed endpoints into a rate-limit ban that blinds the whole app.
+  * A global exception handler, so unexpected errors return a clean JSON error
+    instead of leaking a stack trace containing file paths to the caller.
+"""
+
+import logging
 import os
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 import threading
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+log = logging.getLogger("trader.api")
+
+# Optional shared secret. Unset (the default) keeps local single-user use frictionless;
+# set it before exposing this beyond localhost.
+API_TOKEN = os.getenv("API_TOKEN", "").strip()
+
+# Endpoints that trigger heavy work: a full ~900-ticker scan, or live option-chain
+# fetches. Abusing these gets the upstream data source to rate-limit us.
+_EXPENSIVE_PREFIXES = ("/api/scan", "/api/plan", "/api/momentum/scan", "/api/ticker")
+RATE_LIMIT_WINDOW = 60          # seconds
+RATE_LIMIT_DEFAULT = 120        # requests/min/client for cheap reads
+RATE_LIMIT_EXPENSIVE = 10       # requests/min/client for the heavy ones
+_hits: dict[str, deque] = defaultdict(deque)
+_hits_lock = threading.Lock()
+
+
+def _rate_limited(client: str, path: str) -> bool:
+    cap = RATE_LIMIT_EXPENSIVE if path.startswith(_EXPENSIVE_PREFIXES) else RATE_LIMIT_DEFAULT
+    now = time.time()
+    key = f"{client}:{'exp' if cap == RATE_LIMIT_EXPENSIVE else 'std'}"
+    with _hits_lock:
+        q = _hits[key]
+        while q and now - q[0] > RATE_LIMIT_WINDOW:
+            q.popleft()
+        if len(q) >= cap:
+            return True
+        q.append(now)
+        return False
 
 from scanner import run_scan, get_last_scan, scan_single
 import portfolio
@@ -57,11 +106,55 @@ app = FastAPI(title="Trader API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[o.strip() for o in os.getenv(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    """Rate limiting + optional auth on state-changing calls."""
+    path = request.url.path
+    client = request.client.host if request.client else "unknown"
+
+    if path.startswith("/api") and _rate_limited(client, path):
+        log.warning("rate limit hit: %s %s", client, path)
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limited",
+                     "detail": "Too many requests. This protects the upstream market "
+                               "data feed from being rate-limited, which would blind "
+                               "the whole app."},
+        )
+
+    # Only writes are gated: reads stay open so the dashboard works without config.
+    if API_TOKEN and request.method in ("POST", "PATCH", "DELETE") and path.startswith("/api"):
+        if request.headers.get("X-API-Token", "") != API_TOKEN:
+            log.warning("rejected unauthenticated write: %s %s", client, path)
+            return JSONResponse(status_code=401,
+                                content={"error": "unauthorized",
+                                         "detail": "Missing or invalid X-API-Token."})
+
+    started = time.time()
+    response = await call_next(request)
+    took = (time.time() - started) * 1000
+    if took > 2000:
+        log.info("slow request %s %s -> %.0fms", request.method, path, took)
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled(request: Request, exc: Exception):
+    """Return a clean error rather than leaking a stack trace with local file paths."""
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error",
+                 "detail": "Something failed server-side. Check the backend console."},
+    )
 
 
 @app.get("/api/signals")
@@ -360,4 +453,29 @@ def trigger_momentum(background_tasks: BackgroundTasks):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness + readiness. A monitor needs to distinguish 'process is up' from
+    'process is up but has never successfully scanned', which are very different."""
+    data = get_last_scan()
+    scanned = data.get("total_scanned", 0)
+    stale = None
+    if data.get("scanned_at"):
+        from datetime import datetime, timezone
+        try:
+            when = datetime.strptime(data["scanned_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+            stale = round((datetime.now(timezone.utc) - when).total_seconds() / 60, 1)
+        except Exception:
+            pass
+
+    ready = scanned > 0
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ok" if ready else "starting",
+            "ready": ready,
+            "scanned_tickers": scanned,
+            "scan_running": _scan_running,
+            "minutes_since_scan": stale,
+            "auth_required_on_writes": bool(API_TOKEN),
+        },
+    )
