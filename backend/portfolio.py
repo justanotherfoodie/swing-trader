@@ -382,8 +382,13 @@ def close_position(pos_id: str, exit_value: float | None = None):
                 p["closed_at"] = datetime.now(timezone.utc).isoformat()
                 if exit_value is not None:
                     p["exit_value"] = round(float(exit_value), 2)
+                    # Cost basis of the contracts STILL open - earlier scale-outs already
+                    # accounted for theirs. Accumulate rather than overwrite, or banking a
+                    # partial profit silently erases it from the record the moment the
+                    # remainder is closed.
                     cost = p["net_debit"] * 100 * p["contracts"]
-                    p["realized_pnl"] = round(float(exit_value) - cost, 2)
+                    leg_pnl = round(float(exit_value) - cost, 2)
+                    p["realized_pnl"] = round(p.get("realized_pnl", 0.0) + leg_pnl, 2)
         _save(positions)
     return _load()
 

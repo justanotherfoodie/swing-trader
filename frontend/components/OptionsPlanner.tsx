@@ -5,6 +5,7 @@ import { api, Plan, PlanItem, OpenPosition, Performance } from "@/lib/api";
 export function OptionsPlanner() {
   const [budget, setBudget] = useState(600);
   const [structure, setStructure] = useState<"single" | "spread" | "credit">("single");
+  const [source, setSource] = useState<"swing" | "momentum" | "both">("both");
   const [plan, setPlan] = useState<Plan | null>(null);
   const [loadingPlan, setLoadingPlan] = useState(false);
   const [positions, setPositions] = useState<OpenPosition[]>([]);
@@ -37,7 +38,7 @@ export function OptionsPlanner() {
     setError("");
     setSaved(false);
     try {
-      const p = await api.buildPlan(budget, structure);
+      const p = await api.buildPlan(budget, structure, source);
       setPlan(p);
     } catch {
       setError("Couldn't build a plan — make sure a scan has finished.");
@@ -46,8 +47,21 @@ export function OptionsPlanner() {
     }
   }
 
-  async function scale(id: string, contracts: number) {
-    await api.scalePosition(id, contracts);
+  async function scale(id: string, contracts: number, ticker: string, perContract: number) {
+    const est = perContract * contracts;
+    const raw = window.prompt(
+      `Selling ${contracts} contract(s) of ${ticker}.\n\n` +
+      `Total $ you received for those ${contracts}?\n` +
+      `(Current estimate: $${est.toFixed(2)} — edit to your real fill.)`,
+      est.toFixed(2),
+    );
+    if (raw === null) return;
+    const val = raw.trim() === "" ? undefined : Number(raw);
+    if (val !== undefined && (!isFinite(val) || val < 0)) {
+      alert("That doesn't look like a dollar amount. Nothing was changed.");
+      return;
+    }
+    await api.scalePosition(id, contracts, val);
     setTimeout(loadPositions, 400);
   }
 
@@ -59,8 +73,23 @@ export function OptionsPlanner() {
     setTimeout(loadPositions, 500);
   }
 
-  async function close(id: string) {
-    await api.closePosition(id);
+  // Closing without capturing what you actually sold for leaves realized P&L unknown,
+  // which silently starves the whole feedback loop: the review, the win rate, and the
+  // per-strategy attribution all stay empty forever. So ask, every time.
+  async function close(id: string, ticker: string, estValue: number) {
+    const raw = window.prompt(
+      `Closing ${ticker}.\n\nTotal $ you received for the whole position?\n` +
+      `(Current estimate: $${estValue.toFixed(2)} — edit to your real fill.)\n\n` +
+      `Leave blank to skip, but then this trade won't count toward your stats.`,
+      estValue.toFixed(2),
+    );
+    if (raw === null) return;                       // cancelled - don't close
+    const val = raw.trim() === "" ? undefined : Number(raw);
+    if (val !== undefined && (!isFinite(val) || val < 0)) {
+      alert("That doesn't look like a dollar amount. Nothing was changed.");
+      return;
+    }
+    await api.closePosition(id, val);
     setTimeout(loadPositions, 400);
   }
 
@@ -129,6 +158,28 @@ export function OptionsPlanner() {
               </button>
             );
           })}
+        </div>
+
+        {/* Which scanner feeds the plan */}
+        <div style={{ display: "flex", background: "#0d0f14", border: "1px solid #1e2330", borderRadius: 8, overflow: "hidden" }}>
+          {(["both", "swing", "momentum"] as const).map((s) => (
+            <button
+              key={s}
+              onClick={() => setSource(s)}
+              title={{
+                both: "Use both scanners — daily swing signals and short-term momentum",
+                swing: "Daily swing signals only (5-strategy engine, 5-10 day holds)",
+                momentum: "Short-term momentum only (intraday tape, 1-3 day holds)",
+              }[s]}
+              style={{
+                background: source === s ? "#251f35" : "transparent",
+                color: source === s ? "#c084fc" : "#6b7280",
+                border: "none", padding: "7px 11px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+              }}
+            >
+              {s === "both" ? "Both" : s === "swing" ? "Swing" : "Momentum"}
+            </button>
+          ))}
         </div>
 
         <button
@@ -271,8 +322,10 @@ export function OptionsPlanner() {
               <PositionRow
                 key={p.id}
                 p={p}
-                onClose={() => close(p.id)}
-                onScale={(n) => scale(p.id, n)}
+                onClose={() => close(p.id, p.ticker, p.value)}
+                onScale={(n) =>
+                  scale(p.id, n, p.ticker, p.contracts ? p.value / p.contracts : 0)
+                }
               />
             ))}
           </div>

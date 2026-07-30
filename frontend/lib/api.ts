@@ -173,6 +173,43 @@ export interface LimitGuidance {
   instruction: string;
 }
 
+export interface Alert {
+  level: "action" | "risk";
+  ticker: string | null;
+  title: string;
+  detail: string;
+  pnl: number | null;
+  pnl_pct: number | null;
+}
+
+export interface AlertsResult {
+  alerts: Alert[];
+  count: number;
+}
+
+export interface ReviewTrade {
+  ticker: string;
+  kind: string;
+  closed_at: string;
+  realized_pnl: number | null;
+  strategies: string[];
+  quality_score: number | null;
+  iv_verdict: string | null;
+  warnings_at_entry: string[];
+}
+
+export interface ReviewResult {
+  days: number;
+  closed: ReviewTrade[];
+  closed_count: number;
+  tracked_count: number;
+  realized_pnl: number;
+  wins: number;
+  losses: number;
+  prompt: string;
+  performance: Performance;
+}
+
 export interface Environment {
   favourable: boolean;
   score: number;
@@ -304,10 +341,15 @@ export const api = {
   triggerScan: () =>
     fetch(`${API_BASE}/api/scan`, { method: "POST" }).then((r) => r.json()),
   getStatus: () => apiFetch<StatusResult>("/api/status"),
-  buildPlan: (budget: number, structure: "single" | "spread" | "credit" = "single") =>
-    apiPost<Plan>("/api/plan", { budget, structure }),
+  buildPlan: (
+    budget: number,
+    structure: "single" | "spread" | "credit" = "single",
+    source: "swing" | "momentum" | "both" = "both",
+  ) => apiPost<Plan>("/api/plan", { budget, structure, source }),
   getRisk: () => apiFetch<RiskStatus>("/api/risk"),
   getAdvice: () => apiFetch<StructureAdvice>("/api/advice"),
+  getAlerts: () => apiFetch<AlertsResult>("/api/alerts"),
+  getReview: (days = 7) => apiFetch<ReviewResult>(`/api/review?days=${days}`),
   savePositions: (items: PlanItem[]) =>
     apiPost<{ status: string; count: number }>("/api/positions", { items }),
   getPositions: () => apiFetch<{ positions: OpenPosition[] }>("/api/positions"),

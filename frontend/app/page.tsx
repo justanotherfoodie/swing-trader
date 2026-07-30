@@ -6,6 +6,8 @@ import { SignalCard } from "@/components/SignalCard";
 import { TickerSearch } from "@/components/TickerSearch";
 import { OptionsPlanner } from "@/components/OptionsPlanner";
 import { MomentumPanel } from "@/components/MomentumPanel";
+import { AlertBar } from "@/components/AlertBar";
+import { WeeklyReview } from "@/components/WeeklyReview";
 
 type Filter = "ALL" | "BUY" | "SELL" | "WATCH";
 
@@ -62,6 +64,9 @@ export default function Dashboard() {
         <span style={{ fontSize: 13, color: "#6b7280" }}>S&P 500 · Daily signals · 5-strategy engine</span>
       </div>
 
+      {/* Anything needing action today, pinned above everything else */}
+      <AlertBar />
+
       {/* Macro bar */}
       {data && (
         <MacroBar
@@ -78,6 +83,9 @@ export default function Dashboard() {
 
       {/* Short-term momentum: 1-3 day holds from the intraday tape */}
       <MomentumPanel />
+
+      {/* Review loop: what closed, and the conditions it was entered under */}
+      <WeeklyReview />
 
       {/* Ticker search */}
       <TickerSearch />
